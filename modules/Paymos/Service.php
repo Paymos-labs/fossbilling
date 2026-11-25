@@ -269,16 +269,37 @@ class Service implements ModuleDiInterface
     {
         $config = self::readDiKey($di, 'config');
         if (is_array($config) && isset($config['url']) && is_scalar($config['url'])) {
-            return rtrim(trim((string) $config['url']), '/');
+            $url = rtrim(trim((string) $config['url']), '/');
+            if ($url !== '') {
+                return $url;
+            }
         }
         if ($config instanceof \ArrayAccess) {
             try {
                 if ($config->offsetExists('url') && is_scalar($config['url'])) {
-                    return rtrim(trim((string) $config['url']), '/');
+                    $url = rtrim(trim((string) $config['url']), '/');
+                    if ($url !== '') {
+                        return $url;
+                    }
                 }
             } catch (\Throwable $e) {
-                return '';
+                // Fall through to FOSSBilling 0.8+ Config::getProperty() / SYSTEM_URL.
             }
+        }
+
+        if (class_exists('\\FOSSBilling\\Config') && method_exists('\\FOSSBilling\\Config', 'getProperty')) {
+            try {
+                $configured = \FOSSBilling\Config::getProperty('url', '');
+                if (is_scalar($configured) && trim((string) $configured) !== '') {
+                    return rtrim(trim((string) $configured), '/');
+                }
+            } catch (\Throwable $e) {
+                // Fall through to SYSTEM_URL.
+            }
+        }
+
+        if (defined('SYSTEM_URL') && is_scalar(SYSTEM_URL) && trim((string) SYSTEM_URL) !== '') {
+            return rtrim(trim((string) SYSTEM_URL), '/');
         }
 
         return '';

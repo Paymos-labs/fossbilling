@@ -100,6 +100,19 @@ final class Translation
             }
         }
 
+        if (class_exists('\\FOSSBilling\\Config') && method_exists('\\FOSSBilling\\Config', 'getProperty')) {
+            foreach (['i18n.locale', 'locale'] as $property) {
+                try {
+                    $configured = \FOSSBilling\Config::getProperty($property, '');
+                    if (is_scalar($configured) && trim((string) $configured) !== '') {
+                        $candidates[] = (string) $configured;
+                    }
+                } catch (\Throwable $e) {
+                    // Ignore config lookup errors in minimal environments.
+                }
+            }
+        }
+
         foreach ($candidates as $candidate) {
             $trimmed = trim((string) $candidate);
             if ($trimmed !== '') {

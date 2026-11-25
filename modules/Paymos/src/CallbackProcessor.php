@@ -619,13 +619,7 @@ final class CallbackProcessor
         $applyPayment = static function (array $payment) use ($di, $apiAdmin, $transactionRecordId, $nowFn): void {
             $txHash = (string) $payment['transaction_id'];
             $description = 'Paymos transaction ' . $txHash . ' (invoice ' . $payment['paymos_invoice_id'] . ')';
-            $txData = [
-                'type' => 'transaction',
-                'rel_id' => ($transactionRecordId !== null && $transactionRecordId !== '')
-                    ? (string) $transactionRecordId
-                    : $txHash,
-                'txn_id' => $txHash,
-            ];
+            $now = (int) $nowFn();
             $txUpdateFields = [
                 'txn_id' => $txHash,
                 'txn_status' => (string) $payment['status'],
@@ -649,6 +643,17 @@ final class CallbackProcessor
                     throw new \RuntimeException('Unable to resolve FOSSBilling Client or Invoice entity for payment settlement.');
                 }
 
+                $effectiveTxId = ($transactionRecordId !== null && $transactionRecordId !== '')
+                    ? (string) $transactionRecordId
+                    : self::createTransactionRecord($di, $invoiceModel, $payment, $txUpdateFields, $now);
+
+                $relId = self::formatClientBalanceRelId($effectiveTxId, $payment, $txHash);
+                $txData = [
+                    'type' => 'transaction',
+                    'rel_id' => $relId,
+                    'txn_id' => $txHash,
+                ];
+
                 $clientService->addFunds($clientModel, (string) $payment['amount'], $description, $txData);
 
                 $isDeposit = is_object($invoiceService)
@@ -659,11 +664,21 @@ final class CallbackProcessor
                     $invoiceService->payInvoiceWithCredits($invoiceModel);
                 }
 
-                self::updateTransactionRecord($di, $apiAdmin, $transactionRecordId, $txUpdateFields, (int) $nowFn());
+                self::updateTransactionRecord($di, $apiAdmin, $effectiveTxId !== '' ? $effectiveTxId : $transactionRecordId, $txUpdateFields, $now);
                 return;
             }
 
             if (is_object($apiAdmin)) {
+                $relId = self::formatClientBalanceRelId(
+                    ($transactionRecordId !== null && $transactionRecordId !== '') ? (string) $transactionRecordId : '',
+                    $payment,
+                    $txHash
+                );
+                $txData = [
+                    'type' => 'transaction',
+                    'rel_id' => $relId,
+                    'txn_id' => $txHash,
+                ];
                 $credited = false;
                 if (method_exists($apiAdmin, 'client_balance_add_funds') || method_exists($apiAdmin, '__call')) {
                     $apiAdmin->client_balance_add_funds([
@@ -671,7 +686,7 @@ final class CallbackProcessor
                         'amount' => (string) $payment['amount'],
                         'description' => $description,
                         'type' => 'Paymos',
-                        'rel_id' => $txHash,
+                        'rel_id' => $relId,
                     ]);
                     $credited = true;
                 } elseif (method_exists($apiAdmin, 'addFunds')) {
@@ -686,7 +701,7 @@ final class CallbackProcessor
                 }
 
                 if ($credited) {
-                    self::updateTransactionRecord($di, $apiAdmin, $transactionRecordId, $txUpdateFields, (int) $nowFn());
+                    self::updateTransactionRecord($di, $apiAdmin, $transactionRecordId, $txUpdateFields, $now);
                     return;
                 }
             }
@@ -703,6 +718,7 @@ final class CallbackProcessor
             if ($logger !== null) {
                 $logger('note', $safeNote, ['invoice_id' => $invoiceId]);
             }
+            self::appendInvoiceNote($di, $invoiceId, $safeNote);
             if ($transactionRecordId !== null && $transactionRecordId !== '' && is_object($apiAdmin)
                 && (method_exists($apiAdmin, 'invoice_transaction_update') || method_exists($apiAdmin, '__call'))
             ) {
@@ -839,6 +855,131 @@ final class CallbackProcessor
         }
 
         return 'invoice.updated';
+    }
+
+    /**
+     * Format a client_balance.rel_id value guaranteed to fit FOSSBilling's VARCHAR(20) column.
+     *
+     * @param array<string, mixed> $payment
+     */
+    public static function formatClientBalanceRelId(string $transactionRecordId, array $payment, string $txHash): string
+    {
+        $candidate = trim($transactionRecordId);
+        if ($candidate === '' && isset($payment['invoice_id']) && is_scalar($payment['invoice_id'])) {
+            $candidate = trim((string) $payment['invoice_id']);
+        }
+        if ($candidate === '') {
+            $candidate = trim($txHash);
+        }
+
+        return substr($candidate, 0, 20);
+    }
+
+    /**
+     * Create a native FOSSBilling Transaction record when settlement arrives via the fixed
+     * /api/guest/paymos/webhook endpoint (where ipn.php has not pre-created a row).
+     *
+     * @param mixed $di
+     * @param array<string, mixed> $payment
+     * @param array<string, mixed> $fields
+     */
+    private static function createTransactionRecord($di, object $invoiceModel, array $payment, array $fields, int $now): string
+    {
+        $db = self::readDiKey($di, 'db');
+        if (!is_object($db) || !method_exists($db, 'dispense') || !method_exists($db, 'store')) {
+            return '';
+        }
+
+        try {
+            $tx = $db->dispense('Transaction');
+            if (!is_object($tx)) {
+                return '';
+            }
+
+            $tx->invoice_id = (int) ($fields['invoice_id'] ?? ($payment['invoice_id'] ?? 0));
+            $gatewayId = null;
+            if (isset($invoiceModel->gateway_id) && is_numeric($invoiceModel->gateway_id) && (int) $invoiceModel->gateway_id > 0) {
+                $gatewayId = (int) $invoiceModel->gateway_id;
+            } elseif (method_exists($db, 'findOne')) {
+                $gw = $db->findOne('PayGateway', 'gateway = :gw', [':gw' => 'Paymos']);
+                if (is_object($gw) && isset($gw->id) && is_numeric($gw->id)) {
+                    $gatewayId = (int) $gw->id;
+                }
+            }
+            if ($gatewayId !== null) {
+                $tx->gateway_id = $gatewayId;
+            }
+
+            $tx->txn_id = (string) ($fields['txn_id'] ?? ($payment['transaction_id'] ?? ''));
+            $tx->txn_status = (string) ($fields['txn_status'] ?? ($payment['status'] ?? 'paid'));
+            $tx->status = 'received';
+            $tx->type = 'payment';
+            $tx->amount = (string) ($fields['amount'] ?? ($payment['amount'] ?? '0'));
+            $tx->currency = (string) ($fields['currency'] ?? ($payment['currency'] ?? ''));
+            $tx->validate_ipn = 1;
+            $tx->ip = isset($_SERVER['REMOTE_ADDR']) && is_scalar($_SERVER['REMOTE_ADDR'])
+                ? substr((string) $_SERVER['REMOTE_ADDR'], 0, 45)
+                : null;
+            $timestamp = date('Y-m-d H:i:s', $now);
+            $tx->created_at = $timestamp;
+            $tx->updated_at = $timestamp;
+
+            $id = $db->store($tx);
+            if (is_numeric($id) && (int) $id > 0) {
+                return (string) (int) $id;
+            }
+        } catch (\Throwable $e) {
+            return '';
+        }
+
+        return '';
+    }
+
+    /**
+     * Persist a redacted audit note onto the FOSSBilling Invoice record (Doctrine or RedBean).
+     *
+     * @param mixed $di
+     */
+    private static function appendInvoiceNote($di, int $invoiceId, string $safeNote): void
+    {
+        if ($invoiceId <= 0 || trim($safeNote) === '') {
+            return;
+        }
+
+        $em = self::readDiKey($di, 'em');
+        if (is_object($em) && method_exists($em, 'find')) {
+            $entity = self::findDoctrineEntity($em, self::DOCTRINE_INVOICE_ENTITY, $invoiceId);
+            if (is_object($entity) && method_exists($entity, 'setNotes')) {
+                try {
+                    $existing = method_exists($entity, 'getNotes') ? trim((string) $entity->getNotes()) : '';
+                    if ($existing === '' || strpos($existing, $safeNote) === false) {
+                        $entity->setNotes($existing !== '' ? ($existing . "\n" . $safeNote) : $safeNote);
+                        if (method_exists($em, 'flush')) {
+                            $em->flush();
+                        }
+                    }
+                    return;
+                } catch (\Throwable $e) {
+                    // Fall back to RedBean below.
+                }
+            }
+        }
+
+        $db = self::readDiKey($di, 'db');
+        if (is_object($db) && method_exists($db, 'getExistingModelById') && method_exists($db, 'store')) {
+            try {
+                $model = $db->getExistingModelById('Invoice', $invoiceId);
+                if (is_object($model)) {
+                    $existing = isset($model->notes) && is_scalar($model->notes) ? trim((string) $model->notes) : '';
+                    if ($existing === '' || strpos($existing, $safeNote) === false) {
+                        $model->notes = $existing !== '' ? ($existing . "\n" . $safeNote) : $safeNote;
+                        $db->store($model);
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Non-fatal in minimal test doubles.
+            }
+        }
     }
 
     /**

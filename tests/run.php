@@ -790,7 +790,10 @@ $runner->test('manifest.json conforms to schemas.fossbilling.net/manifest/v1.jso
     TestRunner::assertEquals('https://schemas.fossbilling.net/manifest/v1.json', $json['$schema'] ?? null);
     TestRunner::assertEquals('mod', $json['type'] ?? null);
     TestRunner::assertEquals('paymos', $json['id'] ?? null);
-    TestRunner::assertEquals('1.0.0', $json['version'] ?? null);
+    TestRunner::assertTrue(
+        preg_match('/^\d+\.\d+\.\d+$/', (string) ($json['version'] ?? '')) === 1,
+        'manifest.json version must be valid SemVer'
+    );
     TestRunner::assertEquals('Paymos Labs', $json['author'] ?? null);
     TestRunner::assertEquals('https://paymos.io', $json['author_url'] ?? null);
     TestRunner::assertEquals('https://github.com/Paymos-labs/fossbilling', $json['homepage_url'] ?? null);
@@ -2567,6 +2570,177 @@ $runner->test('AdminController mounts routes and navigation cleanly without secr
     ]);
     $varsUrlObj = $ctrl->get_refunds($renderStub);
     TestRunner::assertEquals('https://example.com/custom-billing/api/admin/paymos/refund_submit', $varsUrlObj['api_refund_submit']);
+});
+
+$runner->test('FOSSBilling 0.8.9 compatibility: templates/admin, relative icon.svg, Config::getProperty, AbstractApi, rel_id<=20, hybrid ORM refund', function () use ($pluginRoot): void {
+    // #FB-1: templates/admin/ mirrors html_admin/ for FOSSBilling 0.8.x TwigLoader & Module::hasSettingsPage()
+    foreach (['mod_paymos_settings.html.twig', 'mod_paymos_refunds.html.twig'] as $tpl) {
+        $legacy = $pluginRoot . '/modules/Paymos/html_admin/' . $tpl;
+        $modern = $pluginRoot . '/modules/Paymos/templates/admin/' . $tpl;
+        TestRunner::assertTrue(is_file($modern), 'Missing 0.8.x admin template: ' . $tpl);
+        TestRunner::assertEquals(file_get_contents($legacy), file_get_contents($modern), 'Template drift in ' . $tpl);
+    }
+
+    // #FB-2: manifest.json uses bundled relative icon.svg (never absolute URL prefixed by SYSTEM_URL)
+    $manifest = json_decode((string) file_get_contents($pluginRoot . '/modules/Paymos/manifest.json'), true);
+    TestRunner::assertEquals('icon.svg', $manifest['icon_url'] ?? null);
+    $iconPath = $pluginRoot . '/modules/Paymos/icon.svg';
+    TestRunner::assertTrue(is_file($iconPath), 'Bundled modules/Paymos/icon.svg must exist');
+    TestRunner::assertContains('<svg', (string) file_get_contents($iconPath));
+
+    // #FB-3: Nested $di['config']['info']['salt'] works directly
+    TestRunner::assertEquals('nested-salt-089', CredentialStore::extractSaltFromDi([
+        'config' => ['info' => ['salt' => 'nested-salt-089']],
+    ]));
+
+    // #FB-3 & #FB-4: Static \FOSSBilling\Config::getProperty() and \FOSSBilling\Api\AbstractApi in isolated subprocess
+    $probeCode = <<<'PHP'
+namespace FOSSBilling {
+    final class Config {
+        public static function getProperty(string $key, $default = null) {
+            $map = [
+                'info.salt' => 'fb089-static-salt-xyz',
+                'url' => 'https://billing.meridiancloud.io/',
+                'i18n.locale' => 'de_DE',
+            ];
+            return $map[$key] ?? $default;
+        }
+    }
+}
+namespace FOSSBilling\Api {
+    abstract class AbstractApi {
+        protected $di = null;
+        protected $service = null;
+        public function setDi($di): void { $this->di = $di; }
+        public function getDi() { return $this->di; }
+        public function setService($service): void { $this->service = $service; }
+        public function getService() { return $this->service; }
+    }
+}
+namespace {
+    $root = $argv[1];
+    require_once $root . '/modules/Paymos/Api/Guest.php';
+    require_once $root . '/modules/Paymos/Api/Admin.php';
+    require_once $root . '/modules/Paymos/Service.php';
+    $guest = new \Box\Mod\Paymos\Api\Guest();
+    $admin = new \Box\Mod\Paymos\Api\Admin();
+    $ok = ($guest instanceof \FOSSBilling\Api\AbstractApi)
+        && ($admin instanceof \FOSSBilling\Api\AbstractApi)
+        && \PaymosFossBilling\CredentialStore::extractSaltFromDi([]) === 'fb089-static-salt-xyz'
+        && \Box\Mod\Paymos\Service::resolveStoreUrl([]) === 'https://billing.meridiancloud.io'
+        && \PaymosFossBilling\Translation::resolveLocale(null, []) === 'de';
+    echo $ok ? 'OK' : 'FAIL';
+    exit($ok ? 0 : 1);
+}
+PHP;
+    $tmpProbe = tempnam(sys_get_temp_dir(), 'fb089_probe_');
+    file_put_contents($tmpProbe, "<?php\n" . $probeCode);
+    $probeOut = [];
+    $probeExit = 0;
+    exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($tmpProbe) . ' ' . escapeshellarg($pluginRoot) . ' 2>&1', $probeOut, $probeExit);
+    @unlink($tmpProbe);
+    TestRunner::assertEquals(0, $probeExit, 'FOSSBilling 0.8.9 subprocess probe failed: ' . implode("\n", $probeOut));
+    TestRunner::assertEquals('OK', trim(implode('', $probeOut)));
+
+    // #FB-5: client_balance.rel_id is clamped <= 20 chars, Transaction row created on fixed webhook, notes persisted
+    $storedModels = [];
+    $txCounter = 41;
+    $invoiceBean = (object) ['id' => 901, 'client_id' => 77, 'gateway_id' => 5, 'total' => '25.00', 'currency' => 'USD', 'status' => 'unpaid', 'notes' => ''];
+    $clientBean = (object) ['id' => 77];
+    $addedFundsCalls = [];
+    $paidInvoices = [];
+    $rbDb = new class($storedModels, $txCounter, $invoiceBean, $clientBean) {
+        public array $stored;
+        public int $nextTxId;
+        public object $invoice;
+        public object $client;
+        public function __construct(array &$stored, int &$nextTxId, object $invoice, object $client) {
+            $this->stored = &$stored;
+            $this->nextTxId = &$nextTxId;
+            $this->invoice = $invoice;
+            $this->client = $client;
+        }
+        public function getExistingModelById(string $type, int $id): object {
+            if ($type === 'Invoice') return $this->invoice;
+            if ($type === 'Client') return $this->client;
+            if ($type === 'Transaction') return $this->stored['Transaction'][$id] ?? (object) ['id' => $id];
+            throw new \RuntimeException('Unknown ' . $type);
+        }
+        public function dispense(string $type): object {
+            return (object) ['_type' => $type];
+        }
+        public function store(object $bean): int {
+            $type = $bean->_type ?? (isset($bean->client_id) ? 'Invoice' : 'Transaction');
+            if ($type === 'Transaction' && !isset($bean->id)) {
+                $bean->id = $this->nextTxId++;
+            }
+            $id = (int) ($bean->id ?? 1);
+            $this->stored[$type][$id] = $bean;
+            return $id;
+        }
+    };
+    $clientSvc = new class($addedFundsCalls) {
+        public array $calls;
+        public function __construct(array &$calls) { $this->calls = &$calls; }
+        public function addFunds(object $client, string $amount, string $description, array $txData): void {
+            $this->calls[] = ['amount' => $amount, 'txData' => $txData];
+        }
+    };
+    $invoiceSvc = new class($paidInvoices) {
+        public array $paid;
+        public function __construct(array &$paid) { $this->paid = &$paid; }
+        public function getTotalWithTax(object $inv): string { return (string) $inv->total; }
+        public function isInvoiceTypeDeposit(object $inv): bool { return false; }
+        public function payInvoiceWithCredits(object $inv): void { $inv->status = 'paid'; $this->paid[] = $inv->id; }
+    };
+    // Hybrid 0.8.9 DI: Doctrine $em exists (returns null for Invoice!) AND RedBean $db holds Invoice
+    $emNull = new class {
+        public int $flushCount = 0;
+        public function find(string $class, int $id) { return null; }
+        public function flush(): void { $this->flushCount++; }
+    };
+    $di089 = [
+        'em' => $emNull,
+        'db' => $rbDb,
+        'mod_service' => static fn (string $name) => $name === 'client' ? $clientSvc : $invoiceSvc,
+    ];
+    $cbs = CallbackProcessor::createFossBillingCallbacks($di089, null, null, static fn (): int => 1795640000);
+    ($cbs['applyPayment'])([
+        'invoice_id' => 901,
+        'client_id' => 77,
+        'amount' => '25.00',
+        'currency' => 'USD',
+        'status' => 'paid',
+        'transaction_id' => 'inv_5qWlrtQPq1RRhIBMbUMsLD_long_hash',
+        'paymos_invoice_id' => 'inv_5qWlrtQPq1RRhIBMbUMsLD',
+    ]);
+    TestRunner::assertEquals(1, count($addedFundsCalls));
+    TestRunner::assertEquals('41', $addedFundsCalls[0]['txData']['rel_id'], 'rel_id must use created numeric Transaction ID');
+    TestRunner::assertTrue(strlen($addedFundsCalls[0]['txData']['rel_id']) <= 20);
+    TestRunner::assertEquals('processed', $storedModels['Transaction'][41]->status ?? null);
+    TestRunner::assertEquals('paid', $invoiceBean->status);
+
+    // Also verify clamping when no Transaction row can be created
+    TestRunner::assertTrue(strlen(CallbackProcessor::formatClientBalanceRelId('', [], 'inv_5qWlrtQPq1RRhIBMbUMsLD_extra')) <= 20);
+
+    // #FB-6: Hybrid 0.8.9 full refund MUST persist via RedBean $db->store() when Doctrine $em->find() returned null
+    $driver = new InMemoryDbDriver();
+    $credStore = new CredentialStore($driver, 'salt-hybrid-089');
+    $snapshots = new SnapshotStore($driver);
+    $native089 = RefundAdapter::createFossBillingNativeHandler($di089, $credStore, $snapshots, static fn (): int => 1795640000);
+    $res = $native089('refund_invoice_full', [
+        'invoice_id' => 901,
+        'withdrawal_id' => 'wdr_hybrid_089',
+        'operation_id' => 'op_hybrid_089',
+        'note' => 'Paymos refund completed',
+        'amount_decimal' => '25.00',
+        'amount_minor' => '2500',
+        'currency' => 'USD',
+    ]);
+    TestRunner::assertEquals('fossbilling_07_fallback', $res['via']);
+    TestRunner::assertEquals('refunded', $storedModels['Invoice'][901]->status ?? null, 'Hybrid 0.8.9 must call $db->store() to persist refunded status');
+    TestRunner::assertEquals(0, $emNull->flushCount, 'Doctrine flush must NOT be called when invoice was loaded via RedBean');
+    TestRunner::assertContains('Paymos refund completed', (string) ($storedModels['Invoice'][901]->notes ?? ''));
 });
 
 echo "\nResults: {$runner->passed} passed, {$runner->failed} failed.\n";

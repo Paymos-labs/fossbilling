@@ -1,0 +1,172 @@
+{% extends request.ajax ? "layout_blank.html.twig" : "layout_default.html.twig" %}
+
+{% block meta_title %}{{ labels.settings_title }}{% endblock %}
+
+{% block content %}
+<div class="card" id="paymos-settings-card">
+    <div class="card-header">
+        <h3 class="card-title">{{ labels.settings_title }}</h3>
+    </div>
+    <div class="card-body">
+        <div class="mb-4 p-3 border rounded" id="paymos-connect-panel">
+            <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div>
+                    <strong>{{ labels.config_connection_label }}:</strong>
+                    {% if status.connected %}
+                        <span class="badge bg-success ms-1" id="paymos-connection-badge">{{ labels.config_connection_connected }}</span>
+                    {% else %}
+                        <span class="badge bg-secondary ms-1" id="paymos-connection-badge">{{ labels.config_connection_disconnected }}</span>
+                    {% endif %}
+                </div>
+                <button type="button" class="btn btn-primary" id="paymos-connect-button">
+                    {{ status.connected ? labels.connect_reconnect_button : labels.connect_button }}
+                </button>
+            </div>
+            <div class="mt-2 text-muted small" id="paymos-connect-status" role="status" aria-live="polite"></div>
+            {% if not status.https_valid %}
+                <div class="alert alert-warning mt-3 mb-0">{{ labels.connect_https_required }}</div>
+            {% endif %}
+        </div>
+
+        <div class="mb-4">
+            <label class="form-label" for="paymos-webhook-url">{{ labels.config_webhook_url_label }}</label>
+            <input type="text" class="form-control font-monospace" id="paymos-webhook-url" value="{{ callback_url }}" readonly>
+            <div class="form-text">{{ labels.config_webhook_url_description }}</div>
+        </div>
+
+        <form id="paymos-settings-form" method="post" action="{{ api_settings_save }}">
+            <input type="hidden" name="CSRFToken" id="paymos-csrf-token" value="{{ csrf_token }}">
+
+            <div class="mb-3">
+                <label class="form-label" for="paymos-mode">{{ labels.config_mode_label }}</label>
+                <select class="form-select" id="paymos-mode" name="mode">
+                    <option value="sandbox" {% if status.mode == 'sandbox' %}selected{% endif %}>{{ labels.config_mode_sandbox }}</option>
+                    <option value="live" {% if status.mode == 'live' %}selected{% endif %}>{{ labels.config_mode_live }}</option>
+                </select>
+                <div class="form-text">{{ labels.config_mode_description }}</div>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label" for="paymos-button-text">{{ labels.config_button_text_label }}</label>
+                <input type="text" class="form-control" id="paymos-button-text" name="button_text" maxlength="120" value="{{ status.button_text }}" placeholder="{{ labels.pay_button }}">
+                <div class="form-text">{{ labels.config_button_text_description }}</div>
+            </div>
+
+            <button type="submit" class="btn btn-primary" id="paymos-save-settings">{{ labels.config_save_button }}</button>
+            <span class="ms-2 small" id="paymos-settings-feedback" role="status" aria-live="polite"></span>
+        </form>
+    </div>
+</div>
+
+<script>
+(function () {
+    var connectBtn = document.getElementById('paymos-connect-button');
+    var statusEl = document.getElementById('paymos-connect-status');
+    var csrfInput = document.getElementById('paymos-csrf-token');
+    var settingsForm = document.getElementById('paymos-settings-form');
+    var feedbackEl = document.getElementById('paymos-settings-feedback');
+
+    var labels = {
+        starting: {{ labels.connect_starting|json_encode|raw }},
+        waiting: {{ labels.connect_waiting|json_encode|raw }},
+        open: {{ labels.connect_open|json_encode|raw }},
+        blocked: {{ labels.connect_blocked|json_encode|raw }},
+        code: {{ labels.connect_code|json_encode|raw }},
+        failed: {{ labels.connect_failed|json_encode|raw }},
+        success: {{ labels.connect_success|json_encode|raw }},
+        saved: {{ labels.config_saved|json_encode|raw }}
+    };
+
+    function postApi(url, payload) {
+        var body = Object.assign({ CSRFToken: csrfInput ? csrfInput.value : '' }, payload || {});
+        return fetch(url, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': body.CSRFToken },
+            body: JSON.stringify(body)
+        }).then(function (res) {
+            return res.json().then(function (json) {
+                if (!res.ok || (json && json.error)) {
+                    throw new Error((json && json.error && json.error.message) ? json.error.message : labels.failed);
+                }
+                return json && typeof json.result !== 'undefined' ? json.result : json;
+            });
+        });
+    }
+
+    if (connectBtn) {
+        connectBtn.addEventListener('click', function () {
+            connectBtn.disabled = true;
+            var manual = false;
+            statusEl.textContent = labels.starting;
+
+            var approvalTab = window.open('', '_blank');
+            if (approvalTab) {
+                try { approvalTab.opener = null; } catch (e) {}
+            }
+
+            postApi({{ api_connect_start|json_encode|raw }}, { return_url: window.location.href })
+                .then(function (data) {
+                    if (approvalTab && !approvalTab.closed) {
+                        approvalTab.location = data.verification_url;
+                        statusEl.textContent = labels.waiting + ' ' + labels.code + ' ' + data.user_code;
+                    } else {
+                        manual = true;
+                        statusEl.textContent = '';
+                        var link = document.createElement('a');
+                        link.href = data.verification_url;
+                        link.target = '_blank';
+                        link.rel = 'noopener noreferrer';
+                        link.textContent = labels.open;
+                        statusEl.appendChild(document.createTextNode(labels.blocked + ' '));
+                        statusEl.appendChild(link);
+                        statusEl.appendChild(document.createTextNode(' ' + labels.code + ' ' + data.user_code));
+                    }
+
+                    var intervalMs = Math.max(1, Number(data.interval || 5)) * 1000;
+                    setTimeout(function poll() {
+                        postApi({{ api_connect_poll|json_encode|raw }}, {})
+                            .then(function (pollRes) {
+                                if (pollRes.status === 'connected') {
+                                    statusEl.textContent = labels.success;
+                                    window.location.reload();
+                                    return;
+                                }
+                                var nextDelay = pollRes.status === 'slow_down' ? intervalMs + 5000 : intervalMs;
+                                setTimeout(poll, nextDelay);
+                            })
+                            .catch(function () {
+                                if (!manual) {
+                                    statusEl.textContent = labels.failed;
+                                }
+                                connectBtn.disabled = false;
+                            });
+                    }, intervalMs);
+                })
+                .catch(function () {
+                    if (approvalTab && !approvalTab.closed) {
+                        approvalTab.close();
+                    }
+                    statusEl.textContent = labels.failed;
+                    connectBtn.disabled = false;
+                });
+        });
+    }
+
+    if (settingsForm) {
+        settingsForm.addEventListener('submit', function (event) {
+            event.preventDefault();
+            feedbackEl.textContent = '';
+            postApi({{ api_settings_save|json_encode|raw }}, {
+                mode: document.getElementById('paymos-mode').value,
+                button_text: document.getElementById('paymos-button-text').value
+            }).then(function () {
+                feedbackEl.textContent = labels.saved;
+            }).catch(function (err) {
+                feedbackEl.textContent = err.message || labels.failed;
+            });
+        });
+    }
+})();
+</script>
+{% endblock %}

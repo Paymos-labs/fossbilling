@@ -19,7 +19,9 @@ use PaymosFossBilling\SnapshotStore;
 use PaymosFossBilling\Translation;
 
 if (!class_exists(__NAMESPACE__ . '\\AdminApiBase', false)) {
-    if (class_exists('\\Api_Abstract')) {
+    if (class_exists('\\FOSSBilling\\Api\\AbstractApi')) {
+        class_alias('\\FOSSBilling\\Api\\AbstractApi', __NAMESPACE__ . '\\AdminApiBase');
+    } elseif (class_exists('\\Api_Abstract')) {
         class_alias('\\Api_Abstract', __NAMESPACE__ . '\\AdminApiBase');
     } else {
         abstract class AdminApiBase

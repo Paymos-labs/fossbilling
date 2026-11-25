@@ -19,7 +19,9 @@ use PaymosFossBilling\SnapshotStore;
 use Paymos\Webhook\WebhookEvent;
 
 if (!class_exists(__NAMESPACE__ . '\\GuestApiBase', false)) {
-    if (class_exists('\\Api_Abstract')) {
+    if (class_exists('\\FOSSBilling\\Api\\AbstractApi')) {
+        class_alias('\\FOSSBilling\\Api\\AbstractApi', __NAMESPACE__ . '\\GuestApiBase');
+    } elseif (class_exists('\\Api_Abstract')) {
         class_alias('\\Api_Abstract', __NAMESPACE__ . '\\GuestApiBase');
     } else {
         abstract class GuestApiBase

@@ -981,10 +981,14 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                 $em = self::readDiKey($di, 'em');
                 $db = self::readDiKey($di, 'db');
                 $invoiceModel = null;
+                $loadedViaDoctrine = false;
 
                 if (is_object($em) && method_exists($em, 'find')) {
                     try {
                         $invoiceModel = $em->find(self::DOCTRINE_INVOICE_ENTITY, $invoiceId);
+                        if (is_object($invoiceModel)) {
+                            $loadedViaDoctrine = true;
+                        }
                     } catch (\Throwable $e) {
                         $invoiceModel = null;
                     }
@@ -1022,17 +1026,19 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                 }
 
                 if (!$projectedVia20) {
-                    // FOSSBilling 0.7 fallback: mark invoice refunded/note safely without crediting wallet twice.
+                    // FOSSBilling 0.7/0.8 fallback: mark invoice refunded/note safely without crediting wallet twice.
                     if (is_object($invoiceModel)) {
                         if (method_exists($invoiceModel, 'setStatus')) {
                             $invoiceModel->setStatus('refunded');
                         } elseif (property_exists($invoiceModel, 'status') || isset($invoiceModel->status)) {
                             $invoiceModel->status = 'refunded';
                         }
-                        if (is_object($em) && method_exists($em, 'flush')) {
+                        if ($loadedViaDoctrine && is_object($em) && method_exists($em, 'flush')) {
                             $em->flush();
                         } elseif (is_object($db) && method_exists($db, 'store')) {
                             $db->store($invoiceModel);
+                        } elseif (is_object($em) && method_exists($em, 'flush')) {
+                            $em->flush();
                         }
                     }
                     ($callbacks['addNote'])($invoiceId, $note);

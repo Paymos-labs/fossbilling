@@ -59,16 +59,52 @@ final class CredentialStore
     public static function extractSaltFromDi($di): string
     {
         $config = self::readDiKey($di, 'config');
-        if (is_array($config) && isset($config['salt']) && is_scalar($config['salt'])) {
-            return trim((string) $config['salt']);
+        if (is_array($config)) {
+            if (isset($config['info']) && is_array($config['info']) && isset($config['info']['salt']) && is_scalar($config['info']['salt'])) {
+                $nested = trim((string) $config['info']['salt']);
+                if ($nested !== '') {
+                    return $nested;
+                }
+            }
+            if (isset($config['salt']) && is_scalar($config['salt'])) {
+                $flat = trim((string) $config['salt']);
+                if ($flat !== '') {
+                    return $flat;
+                }
+            }
         }
         if ($config instanceof \ArrayAccess) {
             try {
+                if ($config->offsetExists('info')) {
+                    $info = $config['info'];
+                    if (is_array($info) && isset($info['salt']) && is_scalar($info['salt'])) {
+                        $nested = trim((string) $info['salt']);
+                        if ($nested !== '') {
+                            return $nested;
+                        }
+                    }
+                }
                 if ($config->offsetExists('salt') && is_scalar($config['salt'])) {
-                    return trim((string) $config['salt']);
+                    $flat = trim((string) $config['salt']);
+                    if ($flat !== '') {
+                        return $flat;
+                    }
                 }
             } catch (\Throwable $e) {
-                return '';
+                // Fall through to FOSSBilling 0.8+ static Config::getProperty().
+            }
+        }
+
+        if (class_exists('\\FOSSBilling\\Config') && method_exists('\\FOSSBilling\\Config', 'getProperty')) {
+            foreach (['info.salt', 'salt'] as $property) {
+                try {
+                    $value = \FOSSBilling\Config::getProperty($property, '');
+                    if (is_scalar($value) && trim((string) $value) !== '') {
+                        return trim((string) $value);
+                    }
+                } catch (\Throwable $e) {
+                    // Continue trying fallback property keys.
+                }
             }
         }
 
