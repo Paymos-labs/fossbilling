@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.fossbilling.net/manifest/v1.json",
+  "id": "paymos",
+  "type": "mod",
+  "name": "Paymos Stablecoin Payments",
+  "description": "Accept USDT, USDC, USD1, DAI stablecoins and XAUT payments in FOSSBilling with One-Click Connect Paymos, verified webhooks, cron reconciliation, and server-calculated refunds.",
+  "icon_url": "https://paymos.io/img/cms/fossbilling.svg",
+  "homepage_url": "https://github.com/Paymos-labs/fossbilling",
+  "author": "Paymos Labs",
+  "author_url": "https://paymos.io",
+  "license": "MIT",
+  "version": "1.0.0",
+  "minimum_php_version": "8.1.0",
+  "requires": {
+    "fossbilling": ">=0.7.0 <1.0 || ^2.0",
+    "php": ">=8.1"
+  }
+}
