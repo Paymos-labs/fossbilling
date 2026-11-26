@@ -13,9 +13,9 @@
                 <div>
                     <strong>{{ labels.config_connection_label }}:</strong>
                     {% if status.connected %}
-                        <span class="badge bg-success ms-1" id="paymos-connection-badge">{{ labels.config_connection_connected }}</span>
+                        <span class="badge bg-success text-white ms-1" id="paymos-connection-badge">{{ labels.config_connection_connected }}</span>
                     {% else %}
-                        <span class="badge bg-secondary ms-1" id="paymos-connection-badge">{{ labels.config_connection_disconnected }}</span>
+                        <span class="badge bg-secondary text-white ms-1" id="paymos-connection-badge">{{ labels.config_connection_disconnected }}</span>
                     {% endif %}
                 </div>
                 <button type="button" class="btn btn-primary" id="paymos-connect-button">

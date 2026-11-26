@@ -1,6 +1,12 @@
 # Paymos for FOSSBilling
 
+**English** | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [Español](README.es.md) | [Deutsch](README.de.md) | [Türkçe](README.tr.md)
+
 Official FOSSBilling module and payment gateway adapter (`modules/Paymos/` + `library/Payment/Adapter/Paymos/`) for [Paymos](https://paymos.io). It lets clients pay FOSSBilling invoices in four stablecoins (**USDT**, **USDC**, **USD1**, **DAI**) and gold-backed **XAUT** across 13 mainnet networks, and books confirmed payments through FOSSBilling's native billing pipeline (`addFunds` + `payInvoiceWithCredits`) across both FOSSBilling 0.7 (RedBean) and FOSSBilling 0.8+ / 2.0 (Doctrine).
+
+[![Watch: 12 Official CMS Crypto Plugins — 1-Click Connect (Paymos)](https://i.ytimg.com/vi/VMLUGVumYkg/maxresdefault.jpg)](https://www.youtube.com/watch?v=VMLUGVumYkg)
+
+> **Video walkthrough (1:12, subtitles in 6 languages):** [Watch on YouTube](https://www.youtube.com/watch?v=VMLUGVumYkg)
 
 ## Requirements
 
