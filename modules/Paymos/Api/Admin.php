@@ -129,7 +129,30 @@ class Admin extends AdminApiBase
     {
         $this->authorize($data, false, 'manage_settings');
         $storeUrl = $this->resolveSourceUrl($data);
-        return $this->connectHandler($data, false)->status($storeUrl);
+        $status = $this->connectHandler($data, false)->status($storeUrl);
+
+        // Show what the checkout really uses, so the first save does not flip Live to Sandbox.
+        $effective = $this->effectiveSettings();
+        $status['mode'] = $effective['mode'];
+        $status['button_text'] = $effective['button_text'];
+
+        return $status;
+    }
+
+    /**
+     * Module settings once saved; before that, the gateway-form values the checkout still applies.
+     *
+     * @return array{mode: string, button_text: string}
+     */
+    private function effectiveSettings(): array
+    {
+        $store = $this->resolveCredentialStore();
+        $settings = $store->loadSettings();
+        if (!$store->hasSavedSettings()) {
+            $settings = array_merge($settings, Service::readGatewaySettings($this->di));
+        }
+
+        return ['mode' => (string) $settings['mode'], 'button_text' => (string) $settings['button_text']];
     }
 
     /**
@@ -143,9 +166,10 @@ class Admin extends AdminApiBase
         $this->authorize($data, true, 'manage_settings');
 
         $store = $this->resolveCredentialStore();
+        $effective = $this->effectiveSettings();
         $store->saveSettings([
-            'mode' => $data['mode'] ?? 'sandbox',
-            'button_text' => $data['button_text'] ?? '',
+            'mode' => $data['mode'] ?? $effective['mode'],
+            'button_text' => $data['button_text'] ?? $effective['button_text'],
         ] + array_intersect_key($data, array_flip(['api_key', 'api_secret', 'project_id', 'webhook_secret', 'base_url'])));
 
         return [
@@ -390,23 +414,32 @@ class Admin extends AdminApiBase
         return '';
     }
 
+    /**
+     * FOSSBilling core keeps the admin CSRF token in the session under `csrf_token`
+     * (TwigFactory::getCsrfToken, Api controller _checkCSRFToken).
+     */
     private function readSessionCsrfToken(): string
     {
         $session = self::readDiKey($this->di, 'session');
-        if (is_object($session) && method_exists($session, 'get')) {
-            $token = $session->get('CSRFToken');
-            if (is_scalar($token) && trim((string) $token) !== '') {
-                return trim((string) $token);
+        foreach (['csrf_token', 'CSRFToken'] as $key) {
+            if (is_object($session) && method_exists($session, 'get')) {
+                $token = $session->get($key);
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return trim((string) $token);
+                }
             }
-        }
-        if (isset($_SESSION['CSRFToken']) && is_scalar($_SESSION['CSRFToken'])) {
-            return trim((string) $_SESSION['CSRFToken']);
+            if (isset($_SESSION[$key]) && is_scalar($_SESSION[$key]) && trim((string) $_SESSION[$key]) !== '') {
+                return trim((string) $_SESSION[$key]);
+            }
         }
 
         return '';
     }
 
     /**
+     * The core removes `CSRFToken` from the params before calling the module, so the
+     * X-CSRF-Token header the admin pages send is the token that reaches this check.
+     *
      * @param array<string, mixed> $data
      */
     private function readProvidedCsrfToken(array $data): string

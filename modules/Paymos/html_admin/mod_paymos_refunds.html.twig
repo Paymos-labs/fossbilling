@@ -18,7 +18,7 @@
             </div>
         </form>
 
-        <input type="hidden" id="paymos-refund-csrf" value="{{ csrf_token }}">
+        <input type="hidden" id="paymos-refund-csrf" value="{{ CSRFToken|default(csrf_token) }}">
 
         {% if panel_error %}
             <div class="alert alert-danger" role="alert">{{ panel_error }}</div>

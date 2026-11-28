@@ -1002,10 +1002,18 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                 }
 
                 $projectedVia20 = false;
+                $nativeRefundRecorded = false;
                 if (is_callable($modService) && is_object($invoiceModel)) {
                     $invoiceService = $modService('invoice');
                     if (is_object($invoiceService) && method_exists($invoiceService, 'refundInvoice')) {
                         $ref = new \ReflectionMethod($invoiceService, 'refundInvoice');
+                        if ($ref->getNumberOfParameters() < 4 && self::acceptsFirstArgument($ref, $invoiceModel)) {
+                            // FOSSBilling 0.8.x refundInvoice($invoice, $note): writes the credit note or
+                            // negative invoice per invoice_refund_logic and reverses income. It never
+                            // calls a gateway, so the cash already returned by Paymos is not sent twice.
+                            $invoiceService->refundInvoice($invoiceModel, $note);
+                            $nativeRefundRecorded = true;
+                        }
                         if ($ref->getNumberOfParameters() >= 4) {
                             // FOSSBilling 2.0 native external_reversal projection (no second gateway call).
                             $invoiceService->refundInvoice($invoiceModel, $note, null, [
@@ -1053,7 +1061,9 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                     'amount_minor' => $amountMinor,
                     'currency' => $currency,
                     'mode' => RefundStates::FULL,
-                    'via' => $projectedVia20 ? 'fossbilling_2_external_reversal' : 'fossbilling_07_fallback',
+                    'via' => $projectedVia20
+                        ? 'fossbilling_2_external_reversal'
+                        : ($nativeRefundRecorded ? 'fossbilling_08_refund_invoice' : 'fossbilling_07_fallback'),
                 ];
                 $encoded = json_encode($markerPayload, JSON_UNESCAPED_SLASHES);
                 if (is_string($encoded)) {
@@ -1289,6 +1299,30 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     private function ambiguous(RefundIntent $intent, string $reason): NativeProjectionResult
     {
         return new NativeProjectionResult(NativeProjectionResult::AMBIGUOUS, $intent->mode(), null, null, null, null, null, $reason);
+    }
+
+    /**
+     * Whether $argument fits the first parameter's declared type (a Doctrine entity is not a
+     * RedBean \Model_Invoice).
+     */
+    private static function acceptsFirstArgument(\ReflectionMethod $method, object $argument): bool
+    {
+        $params = $method->getParameters();
+        if (!isset($params[0])) {
+            return false;
+        }
+        $type = $params[0]->getType();
+        if ($type === null) {
+            return true;
+        }
+        if (!$type instanceof \ReflectionNamedType) {
+            return false;
+        }
+        if ($type->isBuiltin()) {
+            return in_array($type->getName(), ['object', 'mixed'], true);
+        }
+
+        return is_a($argument, $type->getName());
     }
 
     /**

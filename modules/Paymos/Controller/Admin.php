@@ -229,19 +229,26 @@ class Admin implements ControllerDiInterface
         throw new \RuntimeException('paymos_admin_access_denied', 403);
     }
 
+    /**
+     * FOSSBilling core keeps the admin CSRF token in the session under `csrf_token`
+     * (TwigFactory::getCsrfToken, Api controller _checkCSRFToken).
+     */
     private function csrfToken(): string
     {
         $session = self::readDiKey($this->di, 'session');
-        if (is_object($session) && method_exists($session, 'get')) {
-            $token = $session->get('CSRFToken');
-            if (is_scalar($token)) {
-                return (string) $token;
+        foreach (['csrf_token', 'CSRFToken'] as $key) {
+            if (is_object($session) && method_exists($session, 'get')) {
+                $token = $session->get($key);
+                if (is_scalar($token) && trim((string) $token) !== '') {
+                    return (string) $token;
+                }
+            }
+            if (isset($_SESSION[$key]) && is_scalar($_SESSION[$key]) && trim((string) $_SESSION[$key]) !== '') {
+                return (string) $_SESSION[$key];
             }
         }
 
-        return isset($_SESSION['CSRFToken']) && is_scalar($_SESSION['CSRFToken'])
-            ? (string) $_SESSION['CSRFToken']
-            : '';
+        return '';
     }
 
     /**

@@ -342,22 +342,36 @@ final class CallbackProcessor
             return ['status' => 'paid_late_noted', 'applied' => false];
         }
 
-        $recordedFinal = isset($snapshot['final_status']) && is_string($snapshot['final_status']) && $snapshot['final_status'] !== ''
-            ? $snapshot['final_status']
-            : (isset($snapshot['status']) && StatusMapper::isFinalStatus((string) $snapshot['status']) ? (string) $snapshot['status'] : '');
-        if ($recordedFinal !== '') {
-            $this->log('info', 'Ignored stale status after final snapshot status.', [
-                'invoice_id' => $billingInvoiceId,
-                'recorded_final' => $recordedFinal,
-                'event_type' => $event->type(),
-            ]);
-            return ['status' => 'ignored_final', 'applied' => false];
+        if (self::recordedFinalStatus($snapshot) !== '') {
+            return $this->ignoredAfterFinal($snapshot, $event, $billingInvoiceId);
         }
 
         if ($reverseVerify && $this->requiresReverseVerify($action)) {
             $this->assertReverseVerified($event, $snapshot, $environment, $billingInvoiceId);
         }
 
+        // The webhook, ipn.php and the cron reconciler can reach one invoice at the same time;
+        // each must see what the previous one recorded before it reads the invoice as unpaid.
+        $externalOrderId = (string) $snapshot['external_order_id'];
+        return $this->snapshotStore->withInvoiceLock($billingInvoiceId, function () use ($event, $environment, $fromCron, $externalOrderId, $billingInvoiceId, $action): array {
+            $snapshot = $this->snapshotStore->findByExternalOrderId($externalOrderId);
+            if ($snapshot === null) {
+                throw new \RuntimeException('Paymos FOSSBilling invoice snapshot was not found.');
+            }
+            if (self::recordedFinalStatus($snapshot) !== '') {
+                return $this->ignoredAfterFinal($snapshot, $event, $billingInvoiceId);
+            }
+
+            return $this->settleLocked($event, $environment, $fromCron, $snapshot, $billingInvoiceId, $action);
+        });
+    }
+
+    /**
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>
+     */
+    private function settleLocked(WebhookEvent $event, string $environment, bool $fromCron, array $snapshot, int $billingInvoiceId, string $action): array
+    {
         $billingInvoice = ($this->loadInvoice)($billingInvoiceId);
         if (!is_array($billingInvoice)) {
             if ($fromCron) {
@@ -369,21 +383,14 @@ final class CallbackProcessor
         }
 
         // Roll-back & double-payment guard: once FOSSBilling marks an invoice Paid,
-        // ignore any later complete or downgrade event.
+        // never credit it again or roll it back.
         $isPaid = !empty($billingInvoice['paid']);
         if ($isPaid && $this->isCompleteOrDowngrade($action)) {
-            $this->snapshotStore->markFinalStatus((string) $snapshot['external_order_id'], 'paid');
-            ($this->addNote)($billingInvoiceId, 'Paymos: ignored ' . ($event->type() ?: $event->status()) . ' because invoice is already paid.');
-            return ['status' => 'ignored_already_paid', 'applied' => false];
+            return $this->applyToPaidInvoice($event, $snapshot, $billingInvoiceId, $action);
         }
 
         if ($action !== StatusMapper::ACTION_PAYMENT_COMPLETE) {
-            $nextStatus = $event->status() !== '' ? strtolower($event->status()) : $action;
-            if (StatusMapper::isFinalStatus($nextStatus)) {
-                $this->snapshotStore->markFinalStatus((string) $snapshot['external_order_id'], $nextStatus);
-            } else {
-                $this->snapshotStore->updateStatus((string) $snapshot['paymos_invoice_id'], $nextStatus);
-            }
+            $nextStatus = $this->recordObservedStatus($event, $snapshot, $action);
             ($this->addNote)($billingInvoiceId, 'Paymos invoice status updated: ' . $nextStatus . ' (' . $event->invoiceId() . ').');
             return ['status' => $nextStatus, 'applied' => false];
         }
@@ -412,9 +419,12 @@ final class CallbackProcessor
                 $event->orderAmount(),
                 $event->orderCurrency()
             );
-            ($this->addNote)($billingInvoiceId, 'Manual review: ' . $summary);
+            $this->addNoteOnce((string) $snapshot['external_order_id'], $billingInvoiceId, 'Manual review: ' . $summary);
             throw new \RuntimeException('manual_review: ' . $summary);
         }
+
+        $externalOrderId = (string) $snapshot['external_order_id'];
+        $credit = $this->snapshotStore->fundsCreditState($externalOrderId);
 
         $txId = self::extractConfirmedTransactionId($event);
         $finalStatus = $event->status() !== '' ? strtolower($event->status()) : 'paid';
@@ -429,16 +439,128 @@ final class CallbackProcessor
             'external_order_id' => (string) $snapshot['external_order_id'],
             'environment' => $environment,
             'billing_raw' => $billingInvoice['raw'] ?? null,
+            // How far an earlier attempt got with the client balance; the settlement callback
+            // never repeats addFunds for a credit that reached (or may have reached) the balance.
+            'funds_credit_state' => $credit['state'],
+            'funds_credited' => $credit['state'] === SnapshotStore::FUNDS_CREDITED,
+            'funds_credit_tx_record' => $credit['tx_record'],
+            'funds_credit_rel_id' => $credit['rel_id'],
+            'before_funds_credit' => function (string $transactionRecordId = '', string $relId = '') use ($externalOrderId): void {
+                $this->snapshotStore->recordFundsCredit($externalOrderId, SnapshotStore::FUNDS_CREDIT_PENDING, $transactionRecordId, $relId);
+            },
+            'after_funds_credit' => function (string $transactionRecordId = '', string $relId = '') use ($externalOrderId): void {
+                $this->snapshotStore->recordFundsCredit($externalOrderId, SnapshotStore::FUNDS_CREDITED, $transactionRecordId, $relId);
+            },
+            'reset_funds_credit' => function () use ($externalOrderId): void {
+                $this->snapshotStore->recordFundsCredit($externalOrderId, '');
+            },
         ];
 
-        ($this->applyPayment)($paymentData);
-        $this->snapshotStore->markFinalStatus((string) $snapshot['external_order_id'], $finalStatus, $txId);
+        try {
+            ($this->applyPayment)($paymentData);
+        } catch (\RuntimeException $e) {
+            if (strpos($e->getMessage(), 'manual_review:') === 0) {
+                $this->addNoteOnce($externalOrderId, $billingInvoiceId, 'Manual review: ' . trim(substr($e->getMessage(), strlen('manual_review:'))));
+            }
+            throw $e;
+        }
+        $this->snapshotStore->markFinalStatus($externalOrderId, $finalStatus, $txId);
 
         return [
             'status' => $finalStatus,
             'applied' => true,
             'transaction_id' => $txId,
         ];
+    }
+
+    /**
+     * FOSSBilling already shows the invoice as paid. A complete event is recorded with its
+     * transaction (the Paymos money is real and stays refundable); other events only record
+     * what Paymos reported, so a later real payment is not dropped as stale.
+     *
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>
+     */
+    private function applyToPaidInvoice(WebhookEvent $event, array $snapshot, int $billingInvoiceId, string $action): array
+    {
+        $externalOrderId = (string) $snapshot['external_order_id'];
+        if ($action !== StatusMapper::ACTION_PAYMENT_COMPLETE) {
+            $this->recordObservedStatus($event, $snapshot, $action);
+            $this->addNoteOnce($externalOrderId, $billingInvoiceId, 'Paymos: ignored ' . ($event->type() ?: $event->status()) . ' because invoice is already paid.');
+            return ['status' => 'ignored_already_paid', 'applied' => false];
+        }
+
+        $txId = self::extractConfirmedTransactionId($event);
+        $finalStatus = $event->status() !== '' ? strtolower($event->status()) : 'paid';
+        $creditedHere = $this->snapshotStore->fundsCreditState($externalOrderId)['state'] === SnapshotStore::FUNDS_CREDITED;
+        $this->snapshotStore->markFinalStatus($externalOrderId, $finalStatus, $txId);
+        if ($creditedHere) {
+            // This plugin credited the payment; only the final status was missing.
+            return ['status' => $finalStatus, 'applied' => false, 'transaction_id' => $txId];
+        }
+
+        $this->addNoteOnce(
+            $externalOrderId,
+            $billingInvoiceId,
+            'Manual review: Paymos payment ' . $event->invoiceId() . ' (' . $txId . ') arrived for an invoice that was already paid another way. Refund it in Paymos Refunds or add it to the client balance.'
+        );
+
+        return ['status' => 'paid_elsewhere', 'applied' => false, 'transaction_id' => $txId];
+    }
+
+    /**
+     * Writes an admin note once per snapshot and text: a webhook retried 11 times and a cron pass
+     * every 10 minutes must not pile up the same manual review note.
+     */
+    private function addNoteOnce(string $externalOrderId, int $billingInvoiceId, string $note): void
+    {
+        if ($this->snapshotStore->markNoteOnce($externalOrderId, substr(hash('sha256', $note), 0, 16))) {
+            ($this->addNote)($billingInvoiceId, $note);
+        }
+    }
+
+    /**
+     * Records the status Paymos reported, final or not.
+     *
+     * @param array<string, mixed> $snapshot
+     */
+    private function recordObservedStatus(WebhookEvent $event, array $snapshot, string $action): string
+    {
+        $nextStatus = $event->status() !== '' ? strtolower($event->status()) : $action;
+        if (StatusMapper::isFinalStatus($nextStatus)) {
+            $this->snapshotStore->markFinalStatus((string) $snapshot['external_order_id'], $nextStatus);
+        } else {
+            $this->snapshotStore->updateStatus((string) $snapshot['paymos_invoice_id'], $nextStatus);
+        }
+
+        return $nextStatus;
+    }
+
+    /**
+     * @param array<string, mixed> $snapshot
+     */
+    private static function recordedFinalStatus(array $snapshot): string
+    {
+        if (isset($snapshot['final_status']) && is_string($snapshot['final_status']) && $snapshot['final_status'] !== '') {
+            return $snapshot['final_status'];
+        }
+
+        return isset($snapshot['status']) && StatusMapper::isFinalStatus((string) $snapshot['status']) ? (string) $snapshot['status'] : '';
+    }
+
+    /**
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>
+     */
+    private function ignoredAfterFinal(array $snapshot, WebhookEvent $event, int $billingInvoiceId): array
+    {
+        $this->log('info', 'Ignored stale status after final snapshot status.', [
+            'invoice_id' => $billingInvoiceId,
+            'recorded_final' => self::recordedFinalStatus($snapshot),
+            'event_type' => $event->type(),
+        ]);
+
+        return ['status' => 'ignored_final', 'applied' => false];
     }
 
     /**
@@ -629,6 +751,18 @@ final class CallbackProcessor
                 'invoice_id' => (int) $payment['invoice_id'],
             ];
 
+            // Hooks from CallbackProcessor record that the balance is (being) credited, so a retry
+            // after a failed invoice payment never calls addFunds a second time.
+            $creditState = isset($payment['funds_credit_state']) && is_string($payment['funds_credit_state'])
+                ? $payment['funds_credit_state']
+                : (!empty($payment['funds_credited']) ? SnapshotStore::FUNDS_CREDITED : '');
+            $alreadyCredited = $creditState === SnapshotStore::FUNDS_CREDITED;
+            $storedTxRecord = isset($payment['funds_credit_tx_record']) && is_scalar($payment['funds_credit_tx_record']) ? (string) $payment['funds_credit_tx_record'] : '';
+            $storedRelId = isset($payment['funds_credit_rel_id']) && is_scalar($payment['funds_credit_rel_id']) ? (string) $payment['funds_credit_rel_id'] : '';
+            $beforeCredit = isset($payment['before_funds_credit']) && is_callable($payment['before_funds_credit']) ? $payment['before_funds_credit'] : null;
+            $afterCredit = isset($payment['after_funds_credit']) && is_callable($payment['after_funds_credit']) ? $payment['after_funds_credit'] : null;
+            $resetCredit = isset($payment['reset_funds_credit']) && is_callable($payment['reset_funds_credit']) ? $payment['reset_funds_credit'] : null;
+
             $modService = self::readDiKey($di, 'mod_service');
             if (is_callable($modService)) {
                 $clientService = $modService('client');
@@ -643,25 +777,66 @@ final class CallbackProcessor
                     throw new \RuntimeException('Unable to resolve FOSSBilling Client or Invoice entity for payment settlement.');
                 }
 
-                $effectiveTxId = ($transactionRecordId !== null && $transactionRecordId !== '')
-                    ? (string) $transactionRecordId
-                    : self::createTransactionRecord($di, $invoiceModel, $payment, $txUpdateFields, $now);
+                if ($creditState === SnapshotStore::FUNDS_CREDIT_PENDING) {
+                    // An earlier attempt stopped inside addFunds. The client_balance row it would
+                    // have written decides: there -> finish without crediting, absent -> credit now.
+                    $onBalance = self::balanceHasCredit($db, $clientModel, $storedRelId);
+                    if ($onBalance === null) {
+                        throw new \RuntimeException(
+                            'manual_review: Paymos payment ' . (string) $payment['paymos_invoice_id']
+                            . ' may already be on the client balance. Check the balance, then pay this invoice from it.'
+                        );
+                    }
+                    if ($onBalance) {
+                        if ($afterCredit !== null) {
+                            $afterCredit($storedTxRecord, $storedRelId);
+                        }
+                        $alreadyCredited = true;
+                    }
+                }
 
-                $relId = self::formatClientBalanceRelId($effectiveTxId, $payment, $txHash);
-                $txData = [
-                    'type' => 'transaction',
-                    'rel_id' => $relId,
-                    'txn_id' => $txHash,
-                ];
+                if ($alreadyCredited) {
+                    $effectiveTxId = $storedTxRecord;
+                } else {
+                    $effectiveTxId = ($transactionRecordId !== null && $transactionRecordId !== '')
+                        ? (string) $transactionRecordId
+                        : ($storedTxRecord !== '' ? $storedTxRecord : self::createTransactionRecord($di, $invoiceModel, $payment, $txUpdateFields, $now));
 
-                $clientService->addFunds($clientModel, (string) $payment['amount'], $description, $txData);
+                    $relId = self::formatClientBalanceRelId($effectiveTxId, $payment, $txHash);
+                    $txData = [
+                        'type' => 'transaction',
+                        'rel_id' => $relId,
+                        'txn_id' => $txHash,
+                    ];
 
-                $isDeposit = is_object($invoiceService)
-                    && method_exists($invoiceService, 'isInvoiceTypeDeposit')
-                    && $invoiceService->isInvoiceTypeDeposit($invoiceModel);
+                    if ($beforeCredit !== null) {
+                        $beforeCredit($effectiveTxId, $relId);
+                    }
+                    try {
+                        $clientService->addFunds($clientModel, (string) $payment['amount'], $description, $txData);
+                    } catch (\Throwable $e) {
+                        // FOSSBilling validates before it writes (e.g. no client currency): if nothing
+                        // reached the balance the mark is cleared and the next delivery credits normally.
+                        $onBalance = self::balanceHasCredit($db, $clientModel, $relId);
+                        if ($onBalance === false && $resetCredit !== null) {
+                            $resetCredit();
+                        } elseif ($onBalance === true && $afterCredit !== null) {
+                            $afterCredit($effectiveTxId, $relId);
+                        }
+                        throw $e;
+                    }
+                    if ($afterCredit !== null) {
+                        $afterCredit($effectiveTxId, $relId);
+                    }
+                }
 
-                if (!$isDeposit) {
-                    $invoiceService->payInvoiceWithCredits($invoiceModel);
+                self::payInvoiceFromBalance($invoiceService, $invoiceModel);
+                $paidStatus = self::invoiceModelStatus($invoiceModel);
+                if ($paidStatus !== null && $paidStatus !== 'paid') {
+                    throw new \RuntimeException(
+                        'manual_review: FOSSBilling did not mark invoice #' . (int) $payment['invoice_id']
+                        . ' paid after the Paymos payment was added to the client balance.'
+                    );
                 }
 
                 self::updateTransactionRecord($di, $apiAdmin, $effectiveTxId !== '' ? $effectiveTxId : $transactionRecordId, $txUpdateFields, $now);
@@ -679,18 +854,33 @@ final class CallbackProcessor
                     'rel_id' => $relId,
                     'txn_id' => $txHash,
                 ];
-                $credited = false;
-                if (method_exists($apiAdmin, 'client_balance_add_funds') || method_exists($apiAdmin, '__call')) {
-                    $apiAdmin->client_balance_add_funds([
-                        'id' => $payment['client_id'],
-                        'amount' => (string) $payment['amount'],
-                        'description' => $description,
-                        'type' => 'Paymos',
-                        'rel_id' => $relId,
-                    ]);
-                    $credited = true;
-                } elseif (method_exists($apiAdmin, 'addFunds')) {
-                    $apiAdmin->addFunds($payment['client_id'], (string) $payment['amount'], $description, $txData);
+                if ($creditState === SnapshotStore::FUNDS_CREDIT_PENDING) {
+                    // The admin API offers no balance lookup: never risk a second credit.
+                    throw new \RuntimeException(
+                        'manual_review: Paymos payment ' . (string) $payment['paymos_invoice_id']
+                        . ' may already be on the client balance. Check the balance, then pay this invoice from it.'
+                    );
+                }
+                $credited = $alreadyCredited;
+                $canAddFunds = method_exists($apiAdmin, 'client_balance_add_funds') || method_exists($apiAdmin, '__call');
+                if (!$alreadyCredited && ($canAddFunds || method_exists($apiAdmin, 'addFunds'))) {
+                    if ($beforeCredit !== null) {
+                        $beforeCredit(($transactionRecordId !== null && $transactionRecordId !== '') ? (string) $transactionRecordId : '', $relId);
+                    }
+                    if ($canAddFunds) {
+                        $apiAdmin->client_balance_add_funds([
+                            'id' => $payment['client_id'],
+                            'amount' => (string) $payment['amount'],
+                            'description' => $description,
+                            'type' => 'Paymos',
+                            'rel_id' => $relId,
+                        ]);
+                    } else {
+                        $apiAdmin->addFunds($payment['client_id'], (string) $payment['amount'], $description, $txData);
+                    }
+                    if ($afterCredit !== null) {
+                        $afterCredit(($transactionRecordId !== null && $transactionRecordId !== '') ? (string) $transactionRecordId : '');
+                    }
                     $credited = true;
                 }
 
@@ -752,7 +942,7 @@ final class CallbackProcessor
 
         if (!$result->isVerified()) {
             $reason = $result->reason() !== '' ? $result->reason() : 'reverse_verification_failed';
-            ($this->addNote)($billingInvoiceId, 'Manual review: Paymos reverse verification failed (' . $reason . ').');
+            $this->addNoteOnce((string) $snapshot['external_order_id'], $billingInvoiceId, 'Manual review: Paymos reverse verification failed (' . $reason . ').');
             throw new \RuntimeException('manual_review: Paymos reverse verification failed: ' . $reason);
         }
     }
@@ -1146,6 +1336,100 @@ final class CallbackProcessor
         }
 
         return '';
+    }
+
+    /**
+     * Close the FOSSBilling invoice from the client balance the way the bundled gateways do
+     * (PayPalEmail 0.8.9): an "Add funds" invoice is marked paid without spending the balance
+     * it just topped up; any other invoice is approved first (tryPayWithCredits skips
+     * unapproved invoices) and then paid from the balance.
+     *
+     * @param mixed $invoiceService
+     */
+    private static function payInvoiceFromBalance($invoiceService, object $invoiceModel): void
+    {
+        if (!is_object($invoiceService)) {
+            throw new \RuntimeException('FOSSBilling invoice service is unavailable for payment settlement.');
+        }
+
+        $isDeposit = method_exists($invoiceService, 'isInvoiceTypeDeposit')
+            && $invoiceService->isInvoiceTypeDeposit($invoiceModel);
+        if ($isDeposit) {
+            if (method_exists($invoiceService, 'markAsPaid')) {
+                $invoiceService->markAsPaid($invoiceModel);
+            }
+            return;
+        }
+
+        if (self::isInvoiceModelApproved($invoiceModel) === false && method_exists($invoiceService, 'approveInvoice')) {
+            $invoiceService->approveInvoice($invoiceModel, ['use_credits' => false]);
+        }
+        $invoiceService->payInvoiceWithCredits($invoiceModel);
+    }
+
+    /**
+     * Whether addFunds() wrote the client_balance row for this credit (type `transaction`,
+     * the rel_id the plugin passed). null when the ledger cannot be read.
+     *
+     * @param mixed $db
+     */
+    private static function balanceHasCredit($db, object $clientModel, string $relId): ?bool
+    {
+        if ($relId === '' || !is_object($db) || !method_exists($db, 'findOne')) {
+            return null;
+        }
+        $clientId = method_exists($clientModel, 'getId') ? $clientModel->getId() : ($clientModel->id ?? null);
+        if (!is_numeric($clientId)) {
+            return null;
+        }
+
+        try {
+            $row = $db->findOne('ClientBalance', 'client_id = :client_id AND type = :type AND rel_id = :rel_id', [
+                ':client_id' => (int) $clientId,
+                ':type' => 'transaction',
+                ':rel_id' => $relId,
+            ]);
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row !== null && $row !== false;
+    }
+
+    /**
+     * null when the model does not expose its approval flag.
+     */
+    private static function isInvoiceModelApproved(object $invoiceModel): ?bool
+    {
+        foreach (['isApproved', 'getApproved'] as $method) {
+            if (method_exists($invoiceModel, $method)) {
+                return (bool) $invoiceModel->{$method}();
+            }
+        }
+        if (isset($invoiceModel->approved) && is_scalar($invoiceModel->approved)) {
+            return (bool) (int) $invoiceModel->approved;
+        }
+
+        return null;
+    }
+
+    /**
+     * Lower-case status of a FOSSBilling invoice model, or null when it does not expose one.
+     */
+    private static function invoiceModelStatus(object $invoiceModel): ?string
+    {
+        if (method_exists($invoiceModel, 'getStatus')) {
+            $status = $invoiceModel->getStatus();
+            if ($status instanceof \BackedEnum) {
+                $status = $status->value;
+            }
+            return is_scalar($status) ? strtolower(trim((string) $status)) : null;
+        }
+        if (isset($invoiceModel->status) && is_scalar($invoiceModel->status)) {
+            return strtolower(trim((string) $invoiceModel->status));
+        }
+
+        return null;
     }
 
     private static function extractEntityClientId(object $invoice): ?int

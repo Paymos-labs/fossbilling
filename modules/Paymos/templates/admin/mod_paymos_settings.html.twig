@@ -35,7 +35,7 @@
         </div>
 
         <form id="paymos-settings-form" method="post" action="{{ api_settings_save }}">
-            <input type="hidden" name="CSRFToken" id="paymos-csrf-token" value="{{ csrf_token }}">
+            <input type="hidden" name="CSRFToken" id="paymos-csrf-token" value="{{ CSRFToken|default(csrf_token) }}">
 
             <div class="mb-3">
                 <label class="form-label" for="paymos-mode">{{ labels.config_mode_label }}</label>

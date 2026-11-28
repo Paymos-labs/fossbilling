@@ -449,6 +449,15 @@ final class InMemoryDbDriver implements DbDriverInterface
             return 1;
         }
 
+        if ($normalized === 'UPDATE paymos_invoice_snapshots SET payload_meta = ? WHERE external_order_id = ?') {
+            $extId = (string) $params[1];
+            if (!isset($this->snapshots[$extId])) {
+                return 0;
+            }
+            $this->snapshots[$extId]['payload_meta'] = (string) $params[0];
+            return 1;
+        }
+
         if ($normalized === 'UPDATE paymos_invoice_snapshots SET paid_late_noted = ?, payload_meta = ?, updated_at = ? WHERE external_order_id = ?') {
             $extId = (string) $params[3];
             if (!isset($this->snapshots[$extId])) {
@@ -562,15 +571,23 @@ final class InMemoryDbDriver implements DbDriverInterface
 
         if (preg_match('/\ASELECT \* FROM paymos_invoice_snapshots WHERE updated_at >= \? AND status NOT IN/', $normalized) === 1) {
             $cutoff = (int) $params[0];
-            $excluded = array_slice($params, 1);
+            $hasCursor = str_contains($normalized, 'AND (updated_at > ? OR (updated_at = ? AND external_order_id > ?))');
+            $cursor = $hasCursor ? array_slice($params, -3) : null;
+            $excluded = $hasCursor ? array_slice($params, 1, -3) : array_slice($params, 1);
             preg_match('/LIMIT ([0-9]+)\z/', $normalized, $lm);
             $limit = isset($lm[1]) ? (int) $lm[1] : 50;
-            $matches = array_values(array_filter($this->snapshots, static function (array $r) use ($cutoff, $excluded): bool {
+            $matches = array_values(array_filter($this->snapshots, static function (array $r) use ($cutoff, $excluded, $cursor): bool {
+                if ($cursor !== null
+                    && !((int) $r['updated_at'] > (int) $cursor[0]
+                        || ((int) $r['updated_at'] === (int) $cursor[1] && strcmp((string) $r['external_order_id'], (string) $cursor[2]) > 0))
+                ) {
+                    return false;
+                }
                 return (int) $r['updated_at'] >= $cutoff
                     && !in_array($r['status'], $excluded, true)
                     && ($r['final_status'] === null || $r['final_status'] === '');
             }));
-            usort($matches, static fn (array $a, array $b): int => $a['updated_at'] <=> $b['updated_at']);
+            usort($matches, static fn (array $a, array $b): int => ($a['updated_at'] <=> $b['updated_at']) ?: strcmp((string) $a['external_order_id'], (string) $b['external_order_id']));
             return array_slice($matches, 0, $limit);
         }
 
@@ -823,8 +840,9 @@ $runner->test('Legacy root MVP files are deleted, Paymos.png is in adapter direc
     foreach (['api_key', 'api_secret', 'project_id', 'webhook_secret', 'base_url'] as $forbidden) {
         TestRunner::assertTrue(!array_key_exists($forbidden, $cfg['form']), "Adapter getConfig() must NOT expose {$forbidden}");
     }
-    TestRunner::assertTrue(array_key_exists('mode', $cfg['form']), 'Adapter getConfig() exposes mode');
-    TestRunner::assertTrue(array_key_exists('button_text', $cfg['form']), 'Adapter getConfig() exposes button_text');
+    // Mode and button text are set on the Extensions -> Paymos page only (CMSP-20).
+    TestRunner::assertTrue(!array_key_exists('mode', $cfg['form']), 'Adapter getConfig() must not expose a second mode');
+    TestRunner::assertTrue(!array_key_exists('button_text', $cfg['form']), 'Adapter getConfig() must not expose a second button_text');
 
     // Twig templates contain zero manual credential or unmanaged refund inputs
     $settingsTwig = (string) file_get_contents($pluginRoot . '/modules/Paymos/html_admin/mod_paymos_settings.html.twig');
@@ -2741,6 +2759,783 @@ PHP;
     TestRunner::assertEquals('refunded', $storedModels['Invoice'][901]->status ?? null, 'Hybrid 0.8.9 must call $db->store() to persist refunded status');
     TestRunner::assertEquals(0, $emNull->flushCount, 'Doctrine flush must NOT be called when invoice was loaded via RedBean');
     TestRunner::assertContains('Paymos refund completed', (string) ($storedModels['Invoice'][901]->notes ?? ''));
+});
+
+// ---------------------------------------------------------------------------
+// 7. Feature audit 2026-11-28 (CMSP-02/03/04/09/10/11/13/19/20/38/40)
+// ---------------------------------------------------------------------------
+
+/**
+ * RedBean-style FOSSBilling double: one invoice bean, one client bean, and an invoice
+ * service that behaves like FOSSBilling 0.8.9 (tryPayWithCredits skips unapproved invoices).
+ *
+ * @return array{di: array<string, mixed>, state: \stdClass}
+ */
+function auditFossBillingHost(object $invoiceBean, object $clientBean): array
+{
+    $state = new \stdClass();
+    $state->funds = [];
+    $state->calls = [];
+    $state->deposit = false;
+    $state->failPayOnce = false;
+    $state->refuseToPay = false;
+    $state->onAddFunds = null;
+    $state->rejectAddFundsOnce = null;
+    // client_balance rows: what FOSSBilling's addFunds() persisted (client_id, type, rel_id).
+    $state->ledger = [];
+    $state->ledgerReadable = true;
+
+    $db = new class($invoiceBean, $clientBean, $state) {
+        private object $invoice;
+        private object $client;
+        private \stdClass $st;
+        public function __construct(object $invoice, object $client, \stdClass $st) { $this->invoice = $invoice; $this->client = $client; $this->st = $st; }
+        public function getExistingModelById(string $type, int $id): object {
+            if ($type === 'Invoice' && $id === (int) $this->invoice->id) { return $this->invoice; }
+            if ($type === 'Client' && $id === (int) $this->client->id) { return $this->client; }
+            throw new \RuntimeException('Not found: ' . $type . ' #' . $id);
+        }
+        public function findOne(string $type, string $where, array $bindings = []) {
+            if ($type !== 'ClientBalance' || !$this->st->ledgerReadable) {
+                throw new \RuntimeException('Unsupported lookup: ' . $type);
+            }
+            foreach ($this->st->ledger as $row) {
+                if ((string) $row['client_id'] === (string) ($bindings[':client_id'] ?? '')
+                    && $row['type'] === ($bindings[':type'] ?? '')
+                    && $row['rel_id'] === (string) ($bindings[':rel_id'] ?? '')
+                ) {
+                    return (object) $row;
+                }
+            }
+            return null;
+        }
+    };
+
+    $clientService = new class($state) {
+        private \stdClass $st;
+        public function __construct(\stdClass $st) { $this->st = $st; }
+        public function addFunds(object $client, string $amount, string $description, array $data): void {
+            if ($this->st->rejectAddFundsOnce !== null) {
+                // FOSSBilling validates before persisting (e.g. the client has no currency yet).
+                $message = $this->st->rejectAddFundsOnce;
+                $this->st->rejectAddFundsOnce = null;
+                throw new \RuntimeException($message);
+            }
+            $this->st->ledger[] = ['client_id' => (int) $client->id, 'type' => (string) ($data['type'] ?? 'gift'), 'rel_id' => (string) ($data['rel_id'] ?? ''), 'amount' => $amount];
+            $this->st->funds[] = $amount;
+            if ($this->st->onAddFunds !== null) {
+                $hook = $this->st->onAddFunds;
+                $this->st->onAddFunds = null;
+                $hook();
+            }
+        }
+    };
+
+    $invoiceService = new class($state) {
+        private \stdClass $st;
+        public function __construct(\stdClass $st) { $this->st = $st; }
+        public function getTotalWithTax(object $m): string { return (string) $m->total; }
+        public function isInvoiceTypeDeposit(object $m): bool { return $this->st->deposit; }
+        public function markAsPaid(object $m): void { $this->st->calls[] = 'markAsPaid'; $m->status = 'paid'; }
+        public function approveInvoice(object $m, array $data): bool { $this->st->calls[] = 'approveInvoice:' . json_encode($data); $m->approved = 1; return true; }
+        public function payInvoiceWithCredits(object $m): bool {
+            $this->st->calls[] = 'payInvoiceWithCredits';
+            if ($this->st->failPayOnce) {
+                $this->st->failPayOnce = false;
+                throw new \RuntimeException('Invoice credit payment lock timeout');
+            }
+            if (!$this->st->refuseToPay && !empty($m->approved)) {
+                $m->status = 'paid';
+            }
+            return true;
+        }
+    };
+
+    return [
+        'di' => [
+            'db' => $db,
+            'mod_service' => static fn (string $name): object => $name === 'client' ? $clientService : $invoiceService,
+        ],
+        'state' => $state,
+    ];
+}
+
+/** @return array<string, mixed> */
+function auditSnapshotRow(int $invoiceId, string $paymosInvoiceId, string $amount, int $now, string $status = 'awaiting_payment'): array
+{
+    return [
+        'external_order_id' => 'fossbilling_' . $invoiceId . '_0',
+        'paymos_invoice_id' => $paymosInvoiceId,
+        'platform_ref' => (string) $invoiceId,
+        'client_id' => '61',
+        'amount' => $amount,
+        'invoice_total' => $amount,
+        'currency' => 'USD',
+        'environment' => 'sandbox',
+        'project_id' => 'prj_sandbox_fossbilling_001',
+        'payment_url' => 'https://checkout.paymos.io/' . $paymosInvoiceId,
+        'status' => $status,
+        'renewal_attempt' => 0,
+        'created_at' => $now - 60,
+        'updated_at' => $now - 60,
+    ];
+}
+
+/** @return array<string, mixed> */
+function auditVerifiedInvoice(int $invoiceId, string $paymosInvoiceId, string $amount, string $status = 'paid'): array
+{
+    return [
+        'invoice_id' => $paymosInvoiceId,
+        'project_id' => 'prj_sandbox_fossbilling_001',
+        'status' => $status,
+        'is_test' => true,
+        'order' => ['external_id' => 'fossbilling_' . $invoiceId . '_0', 'amount' => $amount, 'currency' => 'USD'],
+        'payment' => ['transfers' => [['status' => 'confirmed', 'tx_hash' => '0xaudit_' . $invoiceId]]],
+    ];
+}
+
+function auditWebhookBody(string $eventId, string $eventType, array $data, int $now): string
+{
+    return (string) json_encode([
+        'event_id' => $eventId,
+        'event_type' => $eventType,
+        'version' => 1,
+        'occurred_at' => $now,
+        'data' => $data,
+    ]);
+}
+
+$runner->test('Audit CMSP-02: admin actions accept the CSRF token FOSSBilling keeps under csrf_token and sends as X-CSRF-Token', function (): void {
+    $db = new InMemoryDbDriver();
+    $salt = 'salt-cmsp02';
+    $store = new CredentialStore($db, $salt);
+    $transport = new QueueTransport();
+    // FOSSBilling core keeps the token under `csrf_token` and strips `CSRFToken` from params before the module runs.
+    $session = new class {
+        public function get(string $key) { return $key === 'csrf_token' ? 'core-csrf-0889' : null; }
+    };
+    $di = [
+        'config' => ['salt' => $salt, 'url' => 'https://billing.example'],
+        'auth' => new class { public function isAdminLoggedIn(): bool { return true; } },
+        'session' => $session,
+    ];
+    $api = new AdminApi();
+    $api->setDi($di);
+    $api->setDbDriver($db);
+    $api->setCredentialStore($store);
+    $api->setConnectClient(new DeviceConnectClient('https://app.paymos.io', $transport));
+
+    $transport->enqueue(200, [
+        'device_code' => 'dc_cmsp02_device',
+        'user_code' => 'CSRF-0889',
+        'verification_uri_complete' => 'https://app.paymos.io/connect/approve?code=CSRF-0889',
+        'expires_in' => 600,
+        'interval' => 5,
+    ]);
+    $previousHeader = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? null;
+    try {
+        $_SERVER['HTTP_X_CSRF_TOKEN'] = 'core-csrf-0889';
+        $start = $api->connect_start([]);
+        TestRunner::assertEquals('CSRF-0889', $start['user_code'], 'Connect must start with the core csrf_token');
+
+        $saved = $api->settings_save(['mode' => 'live']);
+        TestRunner::assertTrue($saved['saved'] === true, 'Settings must save with the core csrf_token');
+
+        $_SERVER['HTTP_X_CSRF_TOKEN'] = 'forged-token';
+        TestRunner::assertThrows(\RuntimeException::class, static fn () => $api->settings_save(['mode' => 'sandbox']), 'csrf_invalid');
+    } finally {
+        if ($previousHeader === null) {
+            unset($_SERVER['HTTP_X_CSRF_TOKEN']);
+        } else {
+            $_SERVER['HTTP_X_CSRF_TOKEN'] = $previousHeader;
+        }
+    }
+
+    // The admin pages render the same core token for their JavaScript.
+    $renderStub = new class {
+        public array $vars = [];
+        public function render(string $tpl, array $vars): array { $this->vars = $vars; return $vars; }
+    };
+    $ctrl = new AdminController();
+    $ctrl->setDi(['is_admin_logged' => true, 'session' => $session]);
+    $ctrl->get_refunds($renderStub);
+    TestRunner::assertEquals('core-csrf-0889', $renderStub->vars['csrf_token'] ?? null, 'Refunds page must carry the core csrf_token');
+});
+
+$runner->test('Audit CMSP-03: an add-funds invoice is marked paid and an unapproved invoice is approved before paying from credit', function (): void {
+    // Deposit ("Add funds") invoice: balance +amount once, invoice marked paid via markAsPaid (no second credit).
+    $deposit = (object) ['id' => 950, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 1, 'total' => '50.00', 'currency' => 'USD', 'notes' => ''];
+    $host = auditFossBillingHost($deposit, (object) ['id' => 61]);
+    $host['state']->deposit = true;
+    $cbs = CallbackProcessor::createFossBillingCallbacks($host['di'], null, null, static fn (): int => 1760060000);
+    ($cbs['applyPayment'])([
+        'invoice_id' => 950, 'client_id' => 61, 'amount' => '50', 'currency' => 'USD', 'status' => 'paid',
+        'transaction_id' => '0xdeposit_950', 'paymos_invoice_id' => 'inv_dep_950',
+    ]);
+    TestRunner::assertEquals(['50'], $host['state']->funds, 'Deposit must credit the balance exactly once');
+    TestRunner::assertEquals(['markAsPaid'], $host['state']->calls, 'Deposit invoice must be closed with markAsPaid');
+    TestRunner::assertEquals('paid', $deposit->status, 'Paid add-funds invoice must not stay unpaid');
+
+    // Unapproved invoice: approve without auto-credit, then pay from the credited balance.
+    $draft = (object) ['id' => 951, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 0, 'total' => '30.00', 'currency' => 'USD', 'notes' => ''];
+    $host2 = auditFossBillingHost($draft, (object) ['id' => 61]);
+    $cbs2 = CallbackProcessor::createFossBillingCallbacks($host2['di'], null, null, static fn (): int => 1760060000);
+    ($cbs2['applyPayment'])([
+        'invoice_id' => 951, 'client_id' => 61, 'amount' => '30', 'currency' => 'USD', 'status' => 'paid',
+        'transaction_id' => '0xdraft_951', 'paymos_invoice_id' => 'inv_draft_951',
+    ]);
+    TestRunner::assertEquals(['approveInvoice:{"use_credits":false}', 'payInvoiceWithCredits'], $host2['state']->calls);
+    TestRunner::assertEquals('paid', $draft->status, 'Unapproved invoice must end up paid from the credited balance');
+
+    // FOSSBilling silently declines to pay: the payment must not be reported as applied.
+    $stuck = (object) ['id' => 952, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 1, 'total' => '20.00', 'currency' => 'USD', 'notes' => ''];
+    $host3 = auditFossBillingHost($stuck, (object) ['id' => 61]);
+    $host3['state']->refuseToPay = true;
+    $cbs3 = CallbackProcessor::createFossBillingCallbacks($host3['di'], null, null, static fn (): int => 1760060000);
+    TestRunner::assertThrows(\RuntimeException::class, static fn () => ($cbs3['applyPayment'])([
+        'invoice_id' => 952, 'client_id' => 61, 'amount' => '20', 'currency' => 'USD', 'status' => 'paid',
+        'transaction_id' => '0xstuck_952', 'paymos_invoice_id' => 'inv_stuck_952',
+    ]), 'manual_review');
+    TestRunner::assertEquals('unpaid', $stuck->status);
+});
+
+$runner->test('Audit CMSP-04: a retry after a failed credit payment and a cron pass racing the webhook credit the client once', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760050000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp04', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $events = new PdoEventStore($db, $clock);
+    $config = Config::forWebhooks($credStore);
+    $transport = new QueueTransport();
+
+    // (A) addFunds succeeds, payInvoiceWithCredits throws, Paymos retries the same event.
+    $bean = (object) ['id' => 960, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 1, 'total' => '40.00', 'currency' => 'USD', 'notes' => ''];
+    $host = auditFossBillingHost($bean, (object) ['id' => 61]);
+    $host['state']->failPayOnce = true;
+    $cbs = CallbackProcessor::createFossBillingCallbacks($host['di'], null, null, $clock);
+    $makeProcessor = static fn (): CallbackProcessor => new CallbackProcessor(
+        $config, $events, $snapshots, $cbs['loadInvoice'], $cbs['applyPayment'], $cbs['addNote'],
+        static fn (string $env): Client => new Client($config->clientConfig($env), $transport), null, $clock
+    );
+    $snapshots->save(auditSnapshotRow(960, 'inv_cmsp04_960', '40', $now));
+    $verified960 = auditVerifiedInvoice(960, 'inv_cmsp04_960', '40');
+    $body960 = auditWebhookBody('evt_cmsp04_960', 'invoice.paid', $verified960, $now);
+    $sig960 = signWebhook('whsec_sandbox_fossbilling_secret_001', $body960, $now);
+
+    $transport->enqueue(200, $verified960);
+    $first = $makeProcessor()->handle($body960, $sig960, $now);
+    TestRunner::assertTrue($first['http_status'] !== 200, 'Failed credit payment must be retried by Paymos');
+    TestRunner::assertEquals(['40'], $host['state']->funds);
+    TestRunner::assertEquals('unpaid', $bean->status);
+
+    $transport->enqueue(200, $verified960);
+    $retry = $makeProcessor()->handle($body960, $sig960, $now);
+    TestRunner::assertEquals(200, $retry['http_status'], 'Retry must finish the payment');
+    TestRunner::assertEquals('paid', $bean->status);
+    TestRunner::assertEquals(['40'], $host['state']->funds, 'Retry after a crash must not credit the client a second time');
+    TestRunner::assertEquals('paid', $snapshots->findByExternalOrderId('fossbilling_960_0')['final_status']);
+
+    // (B) The cron reconciler reaches the same invoice while the webhook is crediting it.
+    $bean961 = (object) ['id' => 961, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 1, 'total' => '15.00', 'currency' => 'USD', 'notes' => ''];
+    $host961 = auditFossBillingHost($bean961, (object) ['id' => 61]);
+    $cbs961 = CallbackProcessor::createFossBillingCallbacks($host961['di'], null, null, $clock);
+    $make961 = static fn (): CallbackProcessor => new CallbackProcessor(
+        $config, $events, $snapshots, $cbs961['loadInvoice'], $cbs961['applyPayment'], $cbs961['addNote'],
+        static fn (string $env): Client => new Client($config->clientConfig($env), $transport), null, $clock
+    );
+    $snapshots->save(auditSnapshotRow(961, 'inv_cmsp04_961', '15', $now));
+    $verified961 = auditVerifiedInvoice(961, 'inv_cmsp04_961', '15');
+    $cronOutcome = null;
+    $host961['state']->onAddFunds = static function () use (&$cronOutcome, $make961, $snapshots, $verified961, $now): void {
+        try {
+            $cronOutcome = $make961()->applyTrustedInvoice($verified961, (array) $snapshots->findByExternalOrderId('fossbilling_961_0'), $now);
+        } catch (\Throwable $e) {
+            $cronOutcome = $e;
+        }
+    };
+    $body961 = auditWebhookBody('evt_cmsp04_961', 'invoice.paid', $verified961, $now);
+    $transport->enqueue(200, $verified961);
+    $webhook961 = $make961()->handle($body961, signWebhook('whsec_sandbox_fossbilling_secret_001', $body961, $now), $now);
+    TestRunner::assertEquals(200, $webhook961['http_status']);
+    TestRunner::assertEquals(['15'], $host961['state']->funds, 'Webhook and cron racing on one invoice must credit once');
+    TestRunner::assertTrue($cronOutcome !== true, 'The racing cron pass must not apply the payment again');
+    TestRunner::assertTrue($make961()->applyTrustedInvoice($verified961, (array) $snapshots->findByExternalOrderId('fossbilling_961_0'), $now) === false, 'A later cron pass must see the payment as already applied');
+    TestRunner::assertEquals(['15'], $host961['state']->funds);
+});
+
+$runner->test('Audit CMSP-09: a final 4xx on create ends the creating intent; the next attempt is a fresh invoice with the current amount', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760070000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp09', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $config = Config::fromCredentialStore($credStore, ['mode' => 'sandbox']);
+    $snapshots = new SnapshotStore($db, $clock);
+    $transport = new QueueTransport();
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, ?string $env): Client => new Client($c->clientConfig($env), $transport), null, $clock);
+    $belowMinimum = [
+        'type' => 'https://paymos.io/docs/errors/codes#invoice_amount_below_minimum',
+        'title' => 'Bad Request',
+        'status' => 400,
+        'detail' => 'Invoice amount is below the minimum.',
+        'code' => 'invoice_amount_below_minimum',
+        'field' => 'amount',
+    ];
+
+    // An intent for 0.50 USD stuck in `creating`; the admin has since raised the invoice to 15 USD.
+    $snapshots->save([
+        'external_order_id' => 'fossbilling_970_0',
+        'paymos_invoice_id' => 'pending:fossbilling_970_0',
+        'platform_ref' => '970',
+        'amount' => '0.5',
+        'invoice_total' => '0.5',
+        'currency' => 'USD',
+        'environment' => 'sandbox',
+        'project_id' => 'prj_sandbox_fossbilling_001',
+        'payment_url' => '',
+        'status' => CheckoutService::STATUS_CREATING,
+        'renewal_attempt' => 0,
+        'created_at' => $now - 3600,
+        'updated_at' => $now - 3600,
+    ]);
+    $transport->enqueue(400, $belowMinimum, ['content-type' => 'application/problem+json']);
+    $transport->enqueue(201, [
+        'invoice_id' => 'inv_fb_970_1',
+        'payment_url' => 'https://checkout.paymos.io/inv_fb_970_1',
+        'status' => 'awaiting_client',
+        'expires_at' => $now + 1800,
+    ]);
+    $res = $checkout->createCheckout(['id' => 970, 'total' => '15.00', 'currency' => 'USD', 'client_id' => 61]);
+    TestRunner::assertEquals('inv_fb_970_1', $res['paymos_invoice_id'], 'A rejected intent must not block the next payment');
+    $bodies = array_map(static fn (array $r): array => json_decode((string) $r['body'], true), $transport->requests());
+    TestRunner::assertEquals('0.5', $bodies[0]['amount'], 'The stored intent is replayed once');
+    TestRunner::assertEquals('fossbilling_970_1', $bodies[1]['external_order_id']);
+    TestRunner::assertEquals('15', $bodies[1]['amount'], 'The new attempt uses the current invoice amount');
+
+    // A fresh create rejected with 4xx shows the error now and starts a new attempt next time, without replaying.
+    $transport->enqueue(400, $belowMinimum, ['content-type' => 'application/problem+json']);
+    TestRunner::assertThrows(\Paymos\Exception\ApiException::class, static fn () => $checkout->createCheckout(['id' => 971, 'total' => '0.40', 'currency' => 'USD']));
+    TestRunner::assertTrue(
+        !CheckoutService::isPendingIntent((array) $snapshots->findByExternalOrderId('fossbilling_971_0')),
+        'A definitive 4xx must end the creating intent'
+    );
+    $before = count($transport->requests());
+    $transport->enqueue(201, [
+        'invoice_id' => 'inv_fb_971_1',
+        'payment_url' => 'https://checkout.paymos.io/inv_fb_971_1',
+        'status' => 'awaiting_client',
+        'expires_at' => $now + 1800,
+    ]);
+    $next = $checkout->createCheckout(['id' => 971, 'total' => '12.00', 'currency' => 'USD']);
+    TestRunner::assertEquals('inv_fb_971_1', $next['paymos_invoice_id']);
+    TestRunner::assertEquals($before + 1, count($transport->requests()), 'The rejected attempt must not be replayed');
+    TestRunner::assertEquals('fossbilling_971_1', json_decode((string) $transport->requests()[$before]['body'], true)['external_order_id']);
+
+    // 5xx stays a lost-response case: the same intent is replayed later.
+    $transport->enqueue(503, ['type' => 'about:blank', 'title' => 'Service Unavailable', 'status' => 503, 'detail' => 'Try later.', 'code' => 'unavailable']);
+    TestRunner::assertThrows(\Paymos\Exception\ApiException::class, static fn () => $checkout->createCheckout(['id' => 972, 'total' => '9.00', 'currency' => 'USD']));
+    TestRunner::assertTrue(CheckoutService::isPendingIntent((array) $snapshots->findByExternalOrderId('fossbilling_972_0')), '5xx must keep the intent for replay');
+});
+
+$runner->test('Audit CMSP-10: a stale local expires_at reads the invoice back and reuses it while it is still payable', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760080000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp10', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $config = Config::fromCredentialStore($credStore, ['mode' => 'sandbox']);
+    $snapshots = new SnapshotStore($db, $clock);
+    $transport = new QueueTransport();
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, ?string $env): Client => new Client($c->clientConfig($env), $transport), null, $clock);
+
+    // Created at t0 with expires_at t0+30m; the buyer picked a network at t0+25m, the server moved the deadline, no webhook.
+    $row = auditSnapshotRow(980, 'inv_fb_980_0', '20', $now, 'awaiting_client');
+    $row['expires_at'] = $now - 360;
+    $snapshots->save($row);
+    $transport->enqueue(200, [
+        'invoice_id' => 'inv_fb_980_0',
+        'status' => 'awaiting_payment',
+        'expires_at' => $now + 1140,
+    ]);
+    $res = $checkout->createCheckout(['id' => 980, 'total' => '20.00', 'currency' => 'USD', 'client_id' => 61]);
+    TestRunner::assertEquals('https://checkout.paymos.io/inv_fb_980_0', $res['payment_url'], 'A still payable invoice must be reused');
+    TestRunner::assertEquals(1, count($transport->requests()));
+    TestRunner::assertEquals('GET', $transport->requests()[0]['method'], 'The stale deadline must be read back from Paymos');
+});
+
+$runner->test('Audit CMSP-11: an invoice paid another way keeps a later real Paymos payment visible', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760090000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp11', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $events = new PdoEventStore($db, $clock);
+    $config = Config::forWebhooks($credStore);
+    $transport = new QueueTransport();
+    $applied = 0;
+    $notes = [];
+    $processor = new CallbackProcessor(
+        $config,
+        $events,
+        $snapshots,
+        static fn (int $id): array => ['id' => $id, 'amount' => '25.00', 'currency' => 'USD', 'paid' => true, 'status' => 'paid', 'client_id' => 61],
+        static function () use (&$applied): void { $applied++; },
+        static function (int $id, string $note) use (&$notes): void { $notes[] = $note; },
+        static fn (string $env): Client => new Client($config->clientConfig($env), $transport),
+        null,
+        $clock
+    );
+    $snapshots->save(auditSnapshotRow(965, 'inv_cmsp11_965', '25', $now));
+
+    // The client paid by card; Paymos still reports the crypto payment confirming.
+    $confirming = auditVerifiedInvoice(965, 'inv_cmsp11_965', '25', 'confirming');
+    $confirmingBody = auditWebhookBody('evt_cmsp11_conf', 'invoice.confirming', $confirming, $now);
+    $res1 = $processor->handle($confirmingBody, signWebhook('whsec_sandbox_fossbilling_secret_001', $confirmingBody, $now), $now);
+    TestRunner::assertEquals(200, $res1['http_status']);
+    TestRunner::assertEquals(null, $snapshots->findByExternalOrderId('fossbilling_965_0')['final_status'], 'A non-final event must not record a final paid status');
+
+    // The crypto payment completes: it is recorded with its transaction and flagged for the admin, never credited.
+    $paid = auditVerifiedInvoice(965, 'inv_cmsp11_965', '25', 'paid');
+    $paidBody = auditWebhookBody('evt_cmsp11_paid', 'invoice.paid', $paid, $now);
+    $transport->enqueue(200, $paid);
+    $res2 = $processor->handle($paidBody, signWebhook('whsec_sandbox_fossbilling_secret_001', $paidBody, $now), $now);
+    TestRunner::assertEquals(200, $res2['http_status']);
+    $snap = $snapshots->findByExternalOrderId('fossbilling_965_0');
+    TestRunner::assertEquals('paid', $snap['final_status']);
+    TestRunner::assertEquals('0xaudit_965', $snap['transaction_id'], 'The real Paymos payment must keep its transaction for refunds');
+    TestRunner::assertEquals(0, $applied, 'An already paid invoice must never be credited again');
+    TestRunner::assertTrue(count(array_filter($notes, static fn (string $n): bool => strpos($n, 'Manual review') === 0)) === 1, 'The admin must see a manual review note');
+});
+
+$runner->test('Audit CMSP-13: a fresh create answered with an already final invoice is not bound to this invoice', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760100000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp13', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $config = Config::fromCredentialStore($credStore, ['mode' => 'sandbox']);
+    $snapshots = new SnapshotStore($db, $clock);
+    $transport = new QueueTransport();
+    $checkout = new CheckoutService($config, $snapshots, static fn (Config $c, ?string $env): Client => new Client($c->clientConfig($env), $transport), null, $clock);
+
+    // A reinstalled FOSSBilling reuses invoice number 990; Paymos answers the old, already paid invoice for that key.
+    $transport->enqueue(200, [
+        'invoice_id' => 'inv_old_install_990',
+        'payment_url' => 'https://checkout.paymos.io/inv_old_install_990',
+        'status' => 'paid',
+    ]);
+    $transport->enqueue(201, [
+        'invoice_id' => 'inv_fb_990_1',
+        'payment_url' => 'https://checkout.paymos.io/inv_fb_990_1',
+        'status' => 'awaiting_client',
+        'expires_at' => $now + 1800,
+    ]);
+    $res = $checkout->createCheckout(['id' => 990, 'total' => '100.00', 'currency' => 'USD']);
+    TestRunner::assertEquals('inv_fb_990_1', $res['paymos_invoice_id'], 'The foreign paid invoice must not become this checkout');
+    $old = $snapshots->findByExternalOrderId('fossbilling_990_0');
+    TestRunner::assertTrue($old['paymos_invoice_id'] !== 'inv_old_install_990', 'The foreign invoice must not be bound to the snapshot');
+    TestRunner::assertEquals(null, $snapshots->findByPaymosInvoiceId('inv_old_install_990'));
+});
+
+$runner->test('Audit CMSP-19: FOSSBilling 0.8.9 full refund runs the native refundInvoice($invoice, $note)', function (): void {
+    $bean = (object) ['id' => 930, 'client_id' => 61, 'status' => 'paid', 'total' => '25.00', 'currency' => 'USD', 'notes' => ''];
+    $refundCalls = [];
+    $invoiceSvc = new class($refundCalls) {
+        public array $calls;
+        public function __construct(array &$calls) { $this->calls = &$calls; }
+        public function getTotalWithTax(object $m): string { return (string) $m->total; }
+        public function refundInvoice(object $invoice, $note = null): ?int { $this->calls[] = [(int) $invoice->id, $note]; return 931; }
+    };
+    $stored = [];
+    $db = new class($bean, $stored) {
+        private object $bean;
+        public array $stored;
+        public function __construct(object $bean, array &$stored) { $this->bean = $bean; $this->stored = &$stored; }
+        public function getExistingModelById(string $type, int $id): object {
+            if ($type === 'Invoice' && $id === 930) { return $this->bean; }
+            throw new \RuntimeException('Not found');
+        }
+        public function store(object $bean): int { $this->stored[] = $bean; return (int) ($bean->id ?? 0); }
+    };
+    $di = ['db' => $db, 'mod_service' => static fn (string $name): object => $invoiceSvc];
+    $driver = new InMemoryDbDriver();
+    $native = RefundAdapter::createFossBillingNativeHandler($di, new CredentialStore($driver, 'salt-cmsp19'), new SnapshotStore($driver), static fn (): int => 1760110000);
+    $res = $native('refund_invoice_full', [
+        'invoice_id' => 930,
+        'withdrawal_id' => 'wdr_cmsp19_930',
+        'operation_id' => 'op_cmsp19_930',
+        'note' => 'Full refund completed through Paymos (withdrawal wdr_cmsp19_930).',
+        'amount_decimal' => '25.00',
+        'amount_minor' => '2500',
+        'currency' => 'USD',
+    ]);
+    TestRunner::assertEquals([[930, 'Full refund completed through Paymos (withdrawal wdr_cmsp19_930).']], $refundCalls, 'refundInvoice must run once with the refund note');
+    TestRunner::assertEquals('refunded', $bean->status);
+    TestRunner::assertEquals('paymos_refund_wdr_cmsp19_930', $res['native_id']);
+});
+
+$runner->test('Audit CMSP-20: mode and button text come from the Paymos module page, not the gateway form', function (): void {
+    $form = Payment_Adapter_Paymos::getConfig()['form'];
+    TestRunner::assertTrue(!array_key_exists('mode', $form), 'Gateway form must not offer a second mode switch');
+    TestRunner::assertTrue(!array_key_exists('button_text', $form), 'Gateway form must not offer a second button text');
+
+    $db = new InMemoryDbDriver();
+    $credStore = new CredentialStore($db, 'salt-cmsp20');
+    $credStore->saveCredentials(sampleCredentials());
+
+    // Installations that saved Sandbox in the gateway form before and Live on the module page later.
+    $credStore->saveSettings(['mode' => 'live', 'button_text' => 'Pay in USDT']);
+    $adapter = new Payment_Adapter_Paymos(['mode' => 'sandbox', 'button_text' => 'Old gateway text', 'test_mode' => 0]);
+    $adapter->setDbDriver($db);
+    $adapter->setCredentialStore($credStore);
+    $resolved = $adapter->getResolvedConfig();
+    TestRunner::assertEquals('live', $resolved->environment(), 'Checkout must follow the mode saved on the module page');
+    TestRunner::assertEquals('Pay in USDT', $resolved->buttonText());
+
+    // Installations that never saved the module page keep what the gateway form held.
+    $legacyDb = new InMemoryDbDriver();
+    $legacyStore = new CredentialStore($legacyDb, 'salt-cmsp20-legacy');
+    $legacyStore->saveCredentials(sampleCredentials());
+    $legacy = new Payment_Adapter_Paymos(['mode' => 'live', 'button_text' => 'Legacy text']);
+    $legacy->setDbDriver($legacyDb);
+    $legacy->setCredentialStore($legacyStore);
+    TestRunner::assertEquals('live', $legacy->getResolvedConfig()->environment());
+});
+
+$runner->test('Audit CMSP-38: the reconciler moves past rows it skipped and reaches newer missed payments', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760120000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp38', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $config = Config::forWebhooks($credStore);
+    for ($i = 1; $i <= Reconciler::BATCH_LIMIT; $i++) {
+        $row = auditSnapshotRow(1000 + $i, 'inv_idle_' . $i, '10', $now, 'awaiting_client');
+        $row['updated_at'] = $now - 7200 + $i;
+        $snapshots->save($row);
+    }
+    $missed = auditSnapshotRow(1100, 'inv_missed_1100', '10', $now, 'confirming');
+    $missed['updated_at'] = $now - 600;
+    $snapshots->save($missed);
+
+    $gets = [];
+    $transportApi = new class($gets) implements TransportInterface {
+        public array $gets;
+        public function __construct(array &$gets) { $this->gets = &$gets; }
+        public function request($method, $url, array $headers, $body, $timeoutSeconds) {
+            $id = (string) basename((string) parse_url($url, PHP_URL_PATH));
+            $this->gets[] = $id;
+            $n = (int) preg_replace('/\D+/', '', $id);
+            $platformRef = $id === 'inv_missed_1100' ? 1100 : 1000 + $n;
+            return new HttpResponse(200, (string) json_encode([
+                'invoice_id' => $id,
+                'project_id' => 'prj_sandbox_fossbilling_001',
+                'status' => $id === 'inv_missed_1100' ? 'paid' : 'awaiting_client',
+                'is_test' => true,
+                'order' => ['external_id' => 'fossbilling_' . $platformRef . '_0', 'amount' => '10', 'currency' => 'USD'],
+            ]), []);
+        }
+    };
+    $paid = [];
+    $processor = new CallbackProcessor(
+        $config,
+        new PdoEventStore($db, $clock),
+        $snapshots,
+        static fn (int $id): array => ['id' => $id, 'amount' => '10.00', 'currency' => 'USD', 'paid' => false, 'client_id' => 61],
+        static function (array $p) use (&$paid): void { $paid[] = $p['invoice_id']; },
+        static function (): void {},
+        static fn (string $env): Client => new Client($config->clientConfig($env), $transportApi),
+        null,
+        $clock
+    );
+    $reconciler = new Reconciler($config, $credStore, $snapshots, $processor, static fn (string $env): Client => new Client($config->clientConfig($env), $transportApi), $clock);
+
+    TestRunner::assertEquals(0, $reconciler->run($now), 'The first batch holds only idle invoices');
+    $now += Reconciler::THROTTLE_SECONDS;
+    TestRunner::assertEquals(1, $reconciler->run($now), 'The next pass must reach the newer missed payment');
+    TestRunner::assertEquals([1100], $paid);
+});
+
+$runner->test('Audit CMSP-40: the cron refund sync runs at most once every 10 minutes', function (): void {
+    $db = new InMemoryDbDriver();
+    $now = 1760130000;
+    $clock = static function () use (&$now): int { return $now; };
+    $credStore = new CredentialStore($db, 'salt-cmsp40', $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $refundListCalls = 0;
+    $transport = new class($refundListCalls) implements TransportInterface {
+        public int $calls;
+        public function __construct(int &$calls) { $this->calls = &$calls; }
+        public function request($method, $url, array $headers, $body, $timeoutSeconds) {
+            if ($method === 'GET' && str_contains($url, '/v1/refunds')) {
+                $this->calls++;
+                return new HttpResponse(200, (string) json_encode(['items' => [], 'next_cursor' => null]), []);
+            }
+            throw new \RuntimeException("Unexpected request: {$method} {$url}");
+        }
+    };
+    $svc = new ModuleService();
+    $svc->setDi(['config' => ['salt' => 'salt-cmsp40', 'url' => 'https://billing.example']]);
+    $svc->setDbDriver($db);
+    $svc->setCredentialStore($credStore);
+    $svc->setClock($clock);
+    $svc->setClientFactory(static fn (string $env): Client => new Client(Config::forWebhooks($credStore)->clientConfig($env), $transport));
+
+    TestRunner::assertTrue($svc->handleAfterAdminCronRun(null, $now)['refunds_ran']);
+    $afterFirst = $refundListCalls;
+    TestRunner::assertTrue($afterFirst > 0);
+
+    $now += 60;
+    TestRunner::assertTrue(!$svc->handleAfterAdminCronRun(null, $now)['refunds_ran'], 'A cron tick one minute later must not sync refunds again');
+    TestRunner::assertEquals($afterFirst, $refundListCalls);
+
+    // The admin's manual "run now" still syncs at once.
+    TestRunner::assertTrue($svc->handleAfterAdminCronRun(null, $now, true)['refunds_ran']);
+
+    $now += Reconciler::THROTTLE_SECONDS;
+    TestRunner::assertTrue($svc->handleAfterAdminCronRun(null, $now)['refunds_ran'], 'After 10 minutes the sync runs again');
+});
+
+/**
+ * Shared webhook rig for the review regressions: one sandbox snapshot, a real settlement
+ * callback over auditFossBillingHost(), and a processor factory.
+ *
+ * @return array{processor: callable(): CallbackProcessor, host: array{di: array<string, mixed>, state: \stdClass}, snapshots: SnapshotStore, transport: QueueTransport, notes: \ArrayObject, body: string, sig: string, verified: array<string, mixed>, bean: object}
+ */
+function reviewWebhookRig(int $invoiceId, string $amount, int $now): array
+{
+    $db = new InMemoryDbDriver();
+    $clock = static fn (): int => $now;
+    $credStore = new CredentialStore($db, 'salt-review-' . $invoiceId, $clock);
+    $credStore->saveCredentials(sampleCredentials());
+    $snapshots = new SnapshotStore($db, $clock);
+    $events = new PdoEventStore($db, $clock);
+    $config = Config::forWebhooks($credStore);
+    $transport = new QueueTransport();
+    $bean = (object) ['id' => $invoiceId, 'client_id' => 61, 'status' => 'unpaid', 'approved' => 1, 'total' => $amount . '.00', 'currency' => 'USD', 'notes' => ''];
+    $host = auditFossBillingHost($bean, (object) ['id' => 61]);
+    $cbs = CallbackProcessor::createFossBillingCallbacks($host['di'], null, null, $clock);
+    $notes = new \ArrayObject();
+    $addNote = static function (int $id, string $note) use ($cbs, $notes): void {
+        $notes[] = $note;
+        ($cbs['addNote'])($id, $note);
+    };
+    $snapshots->save(auditSnapshotRow($invoiceId, 'inv_review_' . $invoiceId, $amount, $now));
+    $verified = auditVerifiedInvoice($invoiceId, 'inv_review_' . $invoiceId, $amount);
+    $body = auditWebhookBody('evt_review_' . $invoiceId, 'invoice.paid', $verified, $now);
+
+    return [
+        'processor' => static fn (): CallbackProcessor => new CallbackProcessor(
+            $config, $events, $snapshots, $cbs['loadInvoice'], $cbs['applyPayment'], $addNote,
+            static fn (string $env): Client => new Client($config->clientConfig($env), $transport), null, $clock
+        ),
+        'host' => $host,
+        'snapshots' => $snapshots,
+        'transport' => $transport,
+        'notes' => $notes,
+        'body' => $body,
+        'sig' => signWebhook('whsec_sandbox_fossbilling_secret_001', $body, $now),
+        'verified' => $verified,
+        'bean' => $bean,
+    ];
+}
+
+$runner->test('Review R-plugins-04: until the module page is saved it shows and keeps the mode set in the gateway form', function (): void {
+    $db = new InMemoryDbDriver();
+    $salt = 'salt-review-04';
+    $store = new CredentialStore($db, $salt);
+    $store->saveCredentials(sampleCredentials());
+    // An earlier build kept Live in the gateway form (pay_gateway.config).
+    $payGateways = new class {
+        public function findOne(string $type, string $where, array $bindings = []) {
+            if ($type === 'PayGateway' && ($bindings[':gw'] ?? '') === 'Paymos') {
+                return (object) ['gateway' => 'Paymos', 'config' => json_encode(['mode' => 'live', 'button_text' => 'Pay in crypto'])];
+            }
+            return null;
+        }
+    };
+    $session = new class {
+        public function get(string $key) { return $key === 'csrf_token' ? 'review-04-token' : null; }
+    };
+    $api = new AdminApi();
+    $api->setDi([
+        'config' => ['salt' => $salt, 'url' => 'https://billing.example'],
+        'auth' => new class { public function isAdminLoggedIn(): bool { return true; } },
+        'session' => $session,
+        'db' => $payGateways,
+    ]);
+    $api->setDbDriver($db);
+    $api->setCredentialStore($store);
+
+    $status = $api->status([]);
+    TestRunner::assertEquals('live', $status['mode'], 'The module page must show the mode the checkout really uses');
+    TestRunner::assertEquals('Pay in crypto', $status['button_text']);
+
+    $previousHeader = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? null;
+    try {
+        $_SERVER['HTTP_X_CSRF_TOKEN'] = 'review-04-token';
+        // The admin only changes the button text; the request carries no mode.
+        $saved = $api->settings_save(['button_text' => 'Pay now']);
+    } finally {
+        if ($previousHeader === null) {
+            unset($_SERVER['HTTP_X_CSRF_TOKEN']);
+        } else {
+            $_SERVER['HTTP_X_CSRF_TOKEN'] = $previousHeader;
+        }
+    }
+    TestRunner::assertEquals('live', $saved['settings']['mode'], 'Saving without touching the mode must keep Live');
+    TestRunner::assertEquals('Pay now', $saved['settings']['button_text']);
+
+    $adapter = new Payment_Adapter_Paymos(['mode' => 'live']);
+    $adapter->setDbDriver($db);
+    $adapter->setCredentialStore($store);
+    TestRunner::assertEquals('live', $adapter->getResolvedConfig()->environment());
+});
+
+$runner->test('Review R-plugins-09: a credit attempt that never reached the balance is retried, a credit that did is not repeated', function (): void {
+    $now = 1760140000;
+
+    // (A) FOSSBilling refuses before writing the balance; the next delivery credits normally.
+    $rig = reviewWebhookRig(940, '18', $now);
+    $rig['host']['state']->rejectAddFundsOnce = "You must define the client's currency before adding funds.";
+    $rig['transport']->enqueue(200, $rig['verified']);
+    $first = ($rig['processor'])()->handle($rig['body'], $rig['sig'], $now);
+    TestRunner::assertTrue($first['http_status'] !== 200);
+    $rig['transport']->enqueue(200, $rig['verified']);
+    $retry = ($rig['processor'])()->handle($rig['body'], $rig['sig'], $now);
+    TestRunner::assertEquals(200, $retry['http_status'], 'Once the cause is fixed the payment must settle by itself');
+    TestRunner::assertEquals(['18'], $rig['host']['state']->funds);
+    TestRunner::assertEquals('paid', $rig['bean']->status);
+
+    // (B) addFunds wrote the balance, then the request died before the plugin recorded it.
+    $rig2 = reviewWebhookRig(941, '22', $now);
+    $rig2['snapshots']->recordFundsCredit('fossbilling_941_0', SnapshotStore::FUNDS_CREDIT_PENDING, '', '941');
+    $rig2['host']['state']->ledger[] = ['client_id' => 61, 'type' => 'transaction', 'rel_id' => '941', 'amount' => '22'];
+    $rig2['transport']->enqueue(200, $rig2['verified']);
+    $recovered = ($rig2['processor'])()->handle($rig2['body'], $rig2['sig'], $now);
+    TestRunner::assertEquals(200, $recovered['http_status'], 'A credit found on the balance must be finished, not sent to review');
+    TestRunner::assertEquals([], $rig2['host']['state']->funds, 'The balance already holds the payment: no second addFunds');
+    TestRunner::assertEquals('paid', $rig2['bean']->status);
+});
+
+$runner->test('Review R-plugins-10: a manual review note is written once per case, not on every retry', function (): void {
+    $now = 1760150000;
+    // The balance cannot be checked, so an unconfirmed credit stays in review across retries.
+    $rig = reviewWebhookRig(942, '12', $now);
+    $rig['host']['state']->ledgerReadable = false;
+    $rig['snapshots']->recordFundsCredit('fossbilling_942_0', SnapshotStore::FUNDS_CREDIT_PENDING, '', '942');
+    for ($i = 0; $i < 3; $i++) {
+        $rig['transport']->enqueue(200, $rig['verified']);
+        $res = ($rig['processor'])()->handle($rig['body'], $rig['sig'], $now);
+        TestRunner::assertEquals('manual_review', $res['status']);
+    }
+    TestRunner::assertEquals([], $rig['host']['state']->funds, 'An unconfirmed credit must never be repeated');
+    $manual = array_filter($rig['notes']->getArrayCopy(), static fn (string $n): bool => strpos($n, 'Manual review') === 0);
+    TestRunner::assertEquals(1, count($manual), 'Three deliveries of one case must leave one note');
 });
 
 echo "\nResults: {$runner->passed} passed, {$runner->failed} failed.\n";

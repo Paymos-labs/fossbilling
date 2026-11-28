@@ -37,6 +37,8 @@ if (!interface_exists(__NAMESPACE__ . '\\ModuleDiInterface', false)) {
 
 class Service implements ModuleDiInterface
 {
+    private const REFUND_SYNC_LAST_RUN_KEY = 'refund_sync_last_run';
+
     /** @var mixed */
     protected $di = null;
 
@@ -243,7 +245,7 @@ class Service implements ModuleDiInterface
         try {
             $driver = $this->resolveDbDriver();
             $credentialStore = $this->resolveCredentialStore($driver);
-            if ($credentialStore->isConnected()) {
+            if ($credentialStore->isConnected() && ($forceInvoiceReconcile || $this->isRefundSyncDue($credentialStore, $now))) {
                 $snapshotStore = new SnapshotStore($driver, $this->clock);
                 $refundStore = new RefundIntentStore($driver, $this->clock);
                 $refundAdapter = $this->buildRefundAdapter($credentialStore, $snapshotStore, $refundStore);
@@ -258,6 +260,60 @@ class Service implements ModuleDiInterface
             'invoices_reconciled' => $invoicesReconciled,
             'refunds_ran' => $refundsRan,
         ];
+    }
+
+    /**
+     * FOSSBilling may run its cron every minute; the refund sync (due refunds + RefundDiscovery
+     * for both environments) runs on the same 10-minute rhythm as the invoice sweep.
+     */
+    private function isRefundSyncDue(CredentialStore $credentialStore, ?int $now): bool
+    {
+        $timestamp = $now ?? ($this->clock !== null ? (int) ($this->clock)() : time());
+        $rawLast = $credentialStore->getMetadata(self::REFUND_SYNC_LAST_RUN_KEY);
+        $lastRun = is_string($rawLast) && is_numeric($rawLast) ? (int) $rawLast : 0;
+        if ($lastRun > 0 && ($timestamp - $lastRun) < Reconciler::THROTTLE_SECONDS) {
+            return false;
+        }
+
+        $credentialStore->setMetadata(self::REFUND_SYNC_LAST_RUN_KEY, (string) $timestamp);
+        return true;
+    }
+
+    /**
+     * `mode` / `button_text` an earlier build saved in the Paymos gateway form (pay_gateway.config).
+     * They stay in force until the module page is saved once (see Payment_Adapter_Paymos).
+     *
+     * @param mixed $di
+     * @return array{mode?: string, button_text?: string}
+     */
+    public static function readGatewaySettings($di): array
+    {
+        $db = self::readDiKey($di, 'db');
+        if (!is_object($db) || !method_exists($db, 'findOne')) {
+            return [];
+        }
+
+        try {
+            $gateway = $db->findOne('PayGateway', 'gateway = :gw', [':gw' => 'Paymos']);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $raw = is_object($gateway) && isset($gateway->config) ? $gateway->config : null;
+        $config = is_string($raw) ? json_decode($raw, true) : (is_array($raw) ? $raw : null);
+        if (!is_array($config)) {
+            return [];
+        }
+
+        $settings = [];
+        $mode = isset($config['mode']) && is_scalar($config['mode']) ? strtolower(trim((string) $config['mode'])) : '';
+        if (in_array($mode, ['sandbox', 'live'], true)) {
+            $settings['mode'] = $mode;
+        }
+        if (isset($config['button_text']) && is_scalar($config['button_text']) && trim((string) $config['button_text']) !== '') {
+            $settings['button_text'] = trim((string) $config['button_text']);
+        }
+
+        return $settings;
     }
 
     /**

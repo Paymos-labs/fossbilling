@@ -7,6 +7,24 @@ The public release history also lives at [paymos.io/changelog](https://paymos.io
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-11-28
+
+- fix(fossbilling): CSRF token, add-funds invoices, credit paid once
+
+### Removed
+- `Mode` and `Button Text` from the gateway form: both are set only on **Extensions → Paymos**. Values saved in the gateway form by an earlier build still apply, and that page shows them, until it is saved once.
+
+### Fixed
+- Connect, settings, refunds and manual reconciliation no longer fail with `CSRF token invalid`: the module reads the token FOSSBilling keeps under `csrf_token` and the pages send the core `CSRFToken`.
+- A Paymos payment is credited to the client balance once: webhook, `ipn.php` and the cron reconciler settle an invoice under one lock, and a retry after a failed credit payment only pays the invoice from the balance. An interrupted credit is checked against `client_balance`: found, it is finished without crediting again; absent, it is credited; unreadable, it goes to manual review.
+- Manual review notes are written once per case instead of on every webhook retry and cron pass.
+- A paid "Add funds" invoice is marked paid, an unapproved invoice is approved before it is paid from credit, and an invoice FOSSBilling did not mark paid stays open for review instead of being recorded as settled.
+- An invoice paid another way no longer hides a later Paymos payment: non-final events record their real status, and the Paymos payment is recorded with its transaction and a manual-review note.
+- A definitive `4xx` on invoice creation ends the pending attempt; the next payment creates a new invoice for the current amount. A new attempt answered with an already final invoice is not bound to the FOSSBilling invoice.
+- A passed local `expires_at` reads the invoice back from Paymos before replacing it, so a buyer who already picked a network keeps the same payment link.
+- FOSSBilling 0.8.x full refunds run the native `refundInvoice()` (credit note or negative invoice per `invoice_refund_logic`).
+- The cron reconciler moves past invoices it skipped instead of re-reading the same 50, and the cron refund sync runs at most every 10 minutes.
+
 ## [1.0.4] - 2026-11-27
 
 - chore: rebuild canonical CMS package

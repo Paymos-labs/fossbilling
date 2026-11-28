@@ -191,6 +191,8 @@ class Payment_Adapter_Paymos extends Payment_AdapterAbstract implements
      * Gateway settings exposed in FOSSBilling Payment Gateways configuration.
      * Strictly zero manual API key, API secret, Project ID, or Webhook Secret inputs:
      * credentials are provisioned atomically via One-Click Connect Paymos in Modules -> Paymos.
+     * Mode and button text live only on the Extensions -> Paymos page, so the checkout cannot
+     * run in a mode other than the one the admin sees there.
      *
      * @return array<string, mixed>
      */
@@ -199,34 +201,13 @@ class Payment_Adapter_Paymos extends Payment_AdapterAbstract implements
         return [
             'supports_one_time_payments' => true,
             'supports_subscriptions' => false,
-            'description' => 'Accept USDT, USDC, USD1, DAI stablecoins and XAUT payments through Paymos. Connect your installation with one click under Extensions -> Paymos (Connect Paymos) to provision Sandbox and Live credentials into encrypted storage and register the fixed webhook endpoint (/index.php?_url=/api/guest/paymos/webhook). No manual API keys or webhook secrets are entered here.',
+            'description' => 'Accept USDT, USDC, USD1, DAI stablecoins and XAUT payments through Paymos. Connect your installation with one click under Extensions -> Paymos (Connect Paymos) to provision Sandbox and Live credentials into encrypted storage and register the fixed webhook endpoint (/index.php?_url=/api/guest/paymos/webhook). Sandbox/Live mode and button text are set on the same page. No manual API keys or webhook secrets are entered here.',
             'logo' => [
                 'logo' => '/Paymos/Paymos.png',
                 'height' => '50px',
                 'width' => '50px',
             ],
-            'form' => [
-                'mode' => [
-                    'radio',
-                    [
-                        'multiOptions' => [
-                            'sandbox' => 'Sandbox',
-                            'live' => 'Live',
-                        ],
-                        'label' => 'Mode',
-                        'description' => 'Use Sandbox for test payments, then switch to Live for real orders.',
-                        'required' => false,
-                    ],
-                ],
-                'button_text' => [
-                    'text',
-                    [
-                        'label' => 'Button Text',
-                        'description' => 'Optional custom text for the Paymos invoice payment button.',
-                        'required' => false,
-                    ],
-                ],
-            ],
+            'form' => [],
         ];
     }
 
@@ -619,7 +600,8 @@ class Payment_Adapter_Paymos extends Payment_AdapterAbstract implements
     private function resolveConfig(): Config
     {
         try {
-            return Config::fromCredentialStore($this->resolveCredentialStore(), $this->rawConfig);
+            $store = $this->resolveCredentialStore();
+            return Config::fromCredentialStore($store, $this->legacyGatewayParams($store));
         } catch (\Throwable $e) {
             throw new Payment_Exception(Config::redactStatic($e->getMessage()));
         }
@@ -631,10 +613,23 @@ class Payment_Adapter_Paymos extends Payment_AdapterAbstract implements
     private function resolveWebhookConfig(): Config
     {
         try {
-            return Config::forWebhooks($this->resolveCredentialStore(), $this->rawConfig);
+            $store = $this->resolveCredentialStore();
+            return Config::forWebhooks($store, $this->legacyGatewayParams($store));
         } catch (\Throwable $e) {
             throw new Payment_Exception(Config::redactStatic($e->getMessage()));
         }
+    }
+
+    /**
+     * The Extensions -> Paymos page owns mode and button text. Values an older release saved in
+     * the gateway form still apply until that page is saved once, so an upgrade never flips a
+     * Live checkout back to Sandbox.
+     *
+     * @return array<string, mixed>
+     */
+    private function legacyGatewayParams(CredentialStore $store): array
+    {
+        return $store->hasSavedSettings() ? [] : $this->rawConfig;
     }
 
     /**

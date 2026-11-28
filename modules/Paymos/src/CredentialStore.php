@@ -294,6 +294,14 @@ final class CredentialStore
     }
 
     /**
+     * Whether the admin has saved the module settings page at least once.
+     */
+    public function hasSavedSettings(): bool
+    {
+        return $this->getMetadata(self::SETTINGS_KEY) !== null;
+    }
+
+    /**
      * Persist non-secret display/mode preferences only; rejects manual credential fields.
      *
      * @param array<string, mixed> $settings

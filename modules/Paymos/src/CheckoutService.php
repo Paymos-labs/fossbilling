@@ -19,6 +19,9 @@ final class CheckoutService
 {
     public const STATUS_CREATING = SnapshotStore::STATUS_CREATING;
 
+    /** New keys tried in one checkout when Paymos keeps answering with someone else's final invoice. */
+    private const MAX_FOREIGN_INVOICE_RETRIES = 3;
+
     private Config $config;
     private SnapshotStore $snapshots;
 
@@ -98,43 +101,105 @@ final class CheckoutService
             return $existing;
         }
 
-        if (is_array($existing)) {
+        if (is_array($existing) && !self::isCreateFailed($existing)) {
             $this->closeBeforeReplacing($existing);
         }
 
         $renewCount = is_array($existing) ? ((int) ($existing['renewal_attempt'] ?? 0) + 1) : 0;
-        $externalOrderId = self::buildExternalOrderId($invoiceId, $renewCount);
-        $payload = $this->buildCreatePayload(
-            $this->config->projectId(),
-            $amount,
-            $currency,
-            $externalOrderId,
-            $clientId,
-            $lines
-        );
+        for ($collisions = 0; ; $collisions++) {
+            $externalOrderId = self::buildExternalOrderId($invoiceId, $renewCount);
+            $payload = $this->buildCreatePayload(
+                $this->config->projectId(),
+                $amount,
+                $currency,
+                $externalOrderId,
+                $clientId,
+                $lines
+            );
 
-        // Persist crash-safe pending intent BEFORE POST /v1/invoices.
-        $now = $this->now();
-        $intent = [
-            'external_order_id' => $externalOrderId,
-            'paymos_invoice_id' => self::pendingInvoiceId($externalOrderId),
-            'platform_ref' => (string) $invoiceId,
-            'client_id' => $clientId,
-            'amount' => $amount,
-            'invoice_total' => $amount,
-            'currency' => $currency,
-            'environment' => $this->config->environment(),
-            'project_id' => $this->config->projectId(),
-            'payment_url' => '',
-            'status' => self::STATUS_CREATING,
-            'renewal_attempt' => $renewCount,
-            'created_at' => $now,
-            'updated_at' => $now,
-        ];
-        $this->snapshots->save($intent);
+            // Persist crash-safe pending intent BEFORE POST /v1/invoices.
+            $now = $this->now();
+            $intent = [
+                'external_order_id' => $externalOrderId,
+                'paymos_invoice_id' => self::pendingInvoiceId($externalOrderId),
+                'platform_ref' => (string) $invoiceId,
+                'client_id' => $clientId,
+                'amount' => $amount,
+                'invoice_total' => $amount,
+                'currency' => $currency,
+                'environment' => $this->config->environment(),
+                'project_id' => $this->config->projectId(),
+                'payment_url' => '',
+                'status' => self::STATUS_CREATING,
+                'renewal_attempt' => $renewCount,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+            $this->snapshots->save($intent);
 
-        $response = $this->client($this->config->environment())->invoices()->create($payload);
-        return $this->bindCreatedInvoice($intent, $response);
+            try {
+                $response = $this->client($this->config->environment())->invoices()->create($payload);
+            } catch (ApiException $e) {
+                $this->endIntentIfRejected($intent, $e);
+                throw $e;
+            }
+
+            // A new key comes back unpaid. An already final invoice belongs to another installation
+            // (or a lost local row) that used this key: binding it would book its money here.
+            $status = isset($response['status']) && is_scalar($response['status']) ? strtolower(trim((string) $response['status'])) : '';
+            if (!StatusMapper::isFinalStatus($status)) {
+                return $this->bindCreatedInvoice($intent, $response);
+            }
+
+            $this->snapshots->markCreateFailed($externalOrderId);
+            $foreignInvoiceId = isset($response['invoice_id']) && is_scalar($response['invoice_id']) ? (string) $response['invoice_id'] : '';
+            $this->log('warning', 'Paymos returned an already final invoice for a new external_order_id.', [
+                'invoice_id' => (string) $invoiceId,
+                'external_order_id' => $externalOrderId,
+                'paymos_invoice_id' => $foreignInvoiceId,
+                'status' => $status,
+            ]);
+            if ($collisions + 1 >= self::MAX_FOREIGN_INVOICE_RETRIES) {
+                throw new InvoiceReplacementBlockedException(InvoiceReplacementResult::blocked(
+                    $foreignInvoiceId,
+                    $status,
+                    $status === 'paid' || $status === 'paid_over' ? InvoiceReplacementResult::REASON_PAID : InvoiceReplacementResult::REASON_ENDED_UNPAID,
+                    'Paymos already holds a final invoice for ' . $externalOrderId . '.'
+                ));
+            }
+            $renewCount++;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    public static function isCreateFailed(array $row): bool
+    {
+        return isset($row['status']) && (string) $row['status'] === SnapshotStore::STATUS_CREATE_FAILED;
+    }
+
+    /**
+     * A definitive 4xx means Paymos did not create the invoice and never will for this payload:
+     * the intent ends so the next attempt is a new invoice for the current amount. 408, 429,
+     * 5xx and transport errors may hide a created invoice, so the intent stays for replay.
+     *
+     * @param array<string, mixed> $intent
+     */
+    private function endIntentIfRejected(array $intent, ApiException $e): void
+    {
+        $statusCode = $e->statusCode();
+        if ($statusCode < 400 || $statusCode >= 500 || $statusCode === 408 || $statusCode === 429) {
+            return;
+        }
+
+        $this->snapshots->markCreateFailed((string) $intent['external_order_id']);
+        $this->log('warning', 'Paymos refused the invoice; the next payment attempt creates a new one.', [
+            'invoice_id' => (string) ($intent['platform_ref'] ?? ''),
+            'external_order_id' => (string) $intent['external_order_id'],
+            'status_code' => $statusCode,
+            'code' => $e->errorCode(),
+        ]);
     }
 
     /**
@@ -301,7 +366,18 @@ final class CheckoutService
             $lines
         );
 
-        $response = $this->client((string) $intent['environment'])->invoices()->create($payload);
+        try {
+            $response = $this->client((string) $intent['environment'])->invoices()->create($payload);
+        } catch (ApiException $e) {
+            $this->endIntentIfRejected($intent, $e);
+            $ended = $this->snapshots->findByExternalOrderId((string) $intent['external_order_id']);
+            if (is_array($ended) && self::isCreateFailed($ended)) {
+                // Rejected for good: the checkout continues with a new attempt for the current amount.
+                return $ended;
+            }
+            throw $e;
+        }
+
         return $this->bindCreatedInvoice($intent, $response);
     }
 
@@ -391,7 +467,10 @@ final class CheckoutService
     private function keepsExistingInvoice(array $row): bool
     {
         $now = $this->now();
-        if (InvoiceRenewal::isRequired($row, $now)) {
+        // Only the status decides here: the stored expires_at is stale once the buyer picks a
+        // network (the server extends the deadline without a webhook), so a passed local deadline
+        // is a reason to read the invoice back below, never to replace it.
+        if (InvoiceRenewal::isRequired(['status' => (string) ($row['status'] ?? '')], $now)) {
             return false;
         }
         $localStatus = (string) ($row['final_status'] ?? $row['status'] ?? '');

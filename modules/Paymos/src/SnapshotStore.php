@@ -4,13 +4,21 @@ declare(strict_types=1);
 
 namespace PaymosFossBilling;
 
+use Paymos\Exception\EventInProgressException;
 use Paymos\Plugin\StatusMapper;
 
 final class SnapshotStore
 {
     public const TABLE = 'paymos_invoice_snapshots';
     public const STATUS_CREATING = 'creating';
+    /** Paymos refused the create for good (4xx) or answered with another installation's invoice. */
+    public const STATUS_CREATE_FAILED = 'create_failed';
     public const STATUS_INVOICE_MISSING = 'fossbilling_invoice_missing';
+
+    /** addFunds is about to run: a retry that finds this cannot tell whether the balance was credited. */
+    public const FUNDS_CREDIT_PENDING = 'pending';
+    /** addFunds returned: a retry only has to pay the invoice from the balance. */
+    public const FUNDS_CREDITED = 'credited';
 
     private DbDriverInterface $db;
 
@@ -283,29 +291,44 @@ final class SnapshotStore
     }
 
     /**
+     * Unpaid snapshots of the last day, oldest first. `$after` (the last row of the previous
+     * batch) continues past rows the reconciler skipped without touching them.
+     *
+     * @param array{updated_at: int, external_order_id: string}|null $after
      * @return array<int, array<string, mixed>>
      */
-    public function findUnpaidRecent(int $limit = 50, ?int $since = null): array
+    public function findUnpaidRecent(int $limit = 50, ?int $since = null, ?array $after = null): array
     {
         $this->ensureSchema();
         $limit = max(1, min(100, $limit));
         $cutoff = $since ?? ($this->now() - 86400);
 
+        $params = [
+            $cutoff,
+            self::STATUS_CREATING,
+            self::STATUS_CREATE_FAILED,
+            'paid',
+            'paid_over',
+            'underpaid',
+            'expired',
+            'cancelled',
+            self::STATUS_INVOICE_MISSING,
+        ];
+        $cursorClause = '';
+        if ($after !== null) {
+            $cursorClause = ' AND (updated_at > ? OR (updated_at = ? AND external_order_id > ?))';
+            $params[] = (int) $after['updated_at'];
+            $params[] = (int) $after['updated_at'];
+            $params[] = (string) $after['external_order_id'];
+        }
+
         $rows = $this->db->fetchAll(
             'SELECT * FROM ' . self::TABLE
-            . ' WHERE updated_at >= ? AND status NOT IN (?, ?, ?, ?, ?, ?, ?)'
+            . ' WHERE updated_at >= ? AND status NOT IN (?, ?, ?, ?, ?, ?, ?, ?)'
             . ' AND (final_status IS NULL OR final_status = \'\')'
-            . ' ORDER BY updated_at ASC LIMIT ' . $limit,
-            [
-                $cutoff,
-                self::STATUS_CREATING,
-                'paid',
-                'paid_over',
-                'underpaid',
-                'expired',
-                'cancelled',
-                self::STATUS_INVOICE_MISSING,
-            ]
+            . $cursorClause
+            . ' ORDER BY updated_at ASC, external_order_id ASC LIMIT ' . $limit,
+            $params
         );
 
         $normalized = [];
@@ -341,6 +364,115 @@ final class SnapshotStore
             . ' WHERE external_order_id = ?',
             [$finalStatus, $finalStatus, $transactionId, $this->now(), $externalOrderId]
         );
+    }
+
+    /**
+     * Ends a `creating` intent that must never be replayed: the next checkout cuts a new attempt.
+     */
+    public function markCreateFailed(string $externalOrderId): void
+    {
+        $this->ensureSchema();
+        $row = $this->findByExternalOrderId($externalOrderId);
+        if ($row === null) {
+            return;
+        }
+        $this->updateStatus((string) $row['paymos_invoice_id'], self::STATUS_CREATE_FAILED);
+    }
+
+    /**
+     * How far this plugin got with crediting the client balance for one Paymos invoice.
+     *
+     * `rel_id` is the client_balance.rel_id the credit was written with, so a retry can look it up.
+     *
+     * @return array{state: string, tx_record: string, rel_id: string}
+     */
+    public function fundsCreditState(string $externalOrderId): array
+    {
+        $row = $this->findByExternalOrderId($externalOrderId);
+        $meta = $row === null ? [] : self::decodeMeta($row['payload_meta'] ?? null);
+        $credit = isset($meta['funds_credit']) && is_array($meta['funds_credit']) ? $meta['funds_credit'] : [];
+
+        return [
+            'state' => isset($credit['state']) && is_string($credit['state']) ? $credit['state'] : '',
+            'tx_record' => isset($credit['tx_record']) && is_scalar($credit['tx_record']) ? (string) $credit['tx_record'] : '',
+            'rel_id' => isset($credit['rel_id']) && is_scalar($credit['rel_id']) ? (string) $credit['rel_id'] : '',
+        ];
+    }
+
+    /**
+     * An empty $state clears the mark: the credit attempt provably never reached the balance.
+     */
+    public function recordFundsCredit(string $externalOrderId, string $state, string $txRecord = '', string $relId = ''): void
+    {
+        $this->updateMeta($externalOrderId, static function (array $meta) use ($state, $txRecord, $relId): array {
+            if ($state === '') {
+                unset($meta['funds_credit']);
+            } else {
+                $meta['funds_credit'] = ['state' => $state, 'tx_record' => $txRecord, 'rel_id' => $relId];
+            }
+            return $meta;
+        });
+    }
+
+    /**
+     * True the first time $key is seen for this snapshot: one admin note per case, not per retry.
+     */
+    public function markNoteOnce(string $externalOrderId, string $key): bool
+    {
+        $row = $this->findByExternalOrderId($externalOrderId);
+        if ($row === null) {
+            return true;
+        }
+        $meta = self::decodeMeta($row['payload_meta'] ?? null);
+        if (isset($meta['notes'][$key])) {
+            return false;
+        }
+
+        $this->updateMeta($externalOrderId, static function (array $meta) use ($key): array {
+            $meta['notes'][$key] = true;
+            return $meta;
+        });
+
+        return true;
+    }
+
+    /**
+     * @param callable(array<string, mixed>): array<string, mixed> $change
+     */
+    private function updateMeta(string $externalOrderId, callable $change): void
+    {
+        $this->ensureSchema();
+        $row = $this->findByExternalOrderId($externalOrderId);
+        if ($row === null) {
+            throw new \RuntimeException('Paymos FOSSBilling invoice snapshot was not found.');
+        }
+
+        $encoded = json_encode($change(self::decodeMeta($row['payload_meta'] ?? null)), JSON_UNESCAPED_SLASHES);
+        $this->db->execute(
+            'UPDATE ' . self::TABLE . ' SET payload_meta = ? WHERE external_order_id = ?',
+            [is_string($encoded) ? $encoded : '{}', $externalOrderId]
+        );
+    }
+
+    /**
+     * Runs one settlement of a FOSSBilling invoice at a time (webhook, ipn.php and cron).
+     *
+     * @template T
+     * @param callable(): T $action
+     * @return T
+     */
+    public function withInvoiceLock(int $billingInvoiceId, callable $action)
+    {
+        $lockName = 'paymos-fossbilling-invoice:' . $billingInvoiceId;
+        if (!$this->db->acquireNamedLock($lockName, 10)) {
+            throw new EventInProgressException('paymos_invoice_busy');
+        }
+
+        try {
+            return $action();
+        } finally {
+            $this->db->releaseNamedLock($lockName);
+        }
     }
 
     /**
@@ -426,6 +558,20 @@ final class SnapshotStore
             'created_at' => isset($row['created_at']) && is_numeric($row['created_at']) ? (int) $row['created_at'] : (int) ($row['updated_at'] ?? 0),
             'updated_at' => isset($row['updated_at']) && is_numeric($row['updated_at']) ? (int) $row['updated_at'] : 0,
         ];
+    }
+
+    /**
+     * @param mixed $raw
+     * @return array<string, mixed>
+     */
+    private static function decodeMeta($raw): array
+    {
+        if (!is_string($raw) || $raw === '') {
+            return [];
+        }
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     private function now(): int

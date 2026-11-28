@@ -15,6 +15,7 @@ final class Reconciler
     public const LOOKBACK_SECONDS = 86400;
     public const BATCH_LIMIT = 50;
     private const LAST_RUN_KEY = 'reconcile_last_run';
+    private const CURSOR_KEY = 'reconcile_cursor';
 
     private Config $config;
     private CredentialStore $credentialStore;
@@ -79,7 +80,16 @@ final class Reconciler
             $this->credentialStore->setMetadata(self::LAST_RUN_KEY, (string) $timestamp);
         }
 
-        $rows = $this->snapshotStore->findUnpaidRecent(self::BATCH_LIMIT, $timestamp - self::LOOKBACK_SECONDS);
+        // Rows the reconciler skips keep their updated_at, so a batch ordered by it alone would
+        // re-read the same 50 rows for a day; the cursor walks on and restarts after the last batch.
+        $rows = $this->snapshotStore->findUnpaidRecent(self::BATCH_LIMIT, $timestamp - self::LOOKBACK_SECONDS, $this->readCursor());
+        $last = $rows === [] ? null : $rows[count($rows) - 1];
+        $this->credentialStore->setMetadata(
+            self::CURSOR_KEY,
+            count($rows) >= self::BATCH_LIMIT && $last !== null
+                ? (string) json_encode(['updated_at' => (int) $last['updated_at'], 'external_order_id' => (string) $last['external_order_id']])
+                : null
+        );
         $appliedCount = 0;
 
         foreach ($rows as $row) {
@@ -131,6 +141,24 @@ final class Reconciler
         }
 
         return $appliedCount;
+    }
+
+    /**
+     * @return array{updated_at: int, external_order_id: string}|null
+     */
+    private function readCursor(): ?array
+    {
+        $raw = $this->credentialStore->getMetadata(self::CURSOR_KEY);
+        $decoded = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+        if (!is_array($decoded)
+            || !isset($decoded['updated_at'], $decoded['external_order_id'])
+            || !is_numeric($decoded['updated_at'])
+            || !is_string($decoded['external_order_id'])
+        ) {
+            return null;
+        }
+
+        return ['updated_at' => (int) $decoded['updated_at'], 'external_order_id' => $decoded['external_order_id']];
     }
 
     /**
